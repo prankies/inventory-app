@@ -23,6 +23,14 @@ const initDB = async () => {
       token TEXT PRIMARY KEY,
       email TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS master_items (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      alias TEXT DEFAULT '',
+      category TEXT DEFAULT '',
+      unit TEXT DEFAULT 'Pcs',
+      UNIQUE(name)
+    );
     CREATE TABLE IF NOT EXISTS godowns (
       id SERIAL PRIMARY KEY,
       name TEXT UNIQUE NOT NULL
@@ -163,20 +171,52 @@ app.delete('/api/inventory/:id', auth, async (req, res) => {
   res.json({ message: 'Deleted' });
 });
 
-// Item name suggestions (autocomplete)
+// Item name suggestions (autocomplete) — searches master list + existing inventory
 app.get('/api/suggestions', auth, async (req, res) => {
   const q = (req.query.q || '').toLowerCase();
   const { rows } = await pool.query(
-    `SELECT DISTINCT name, category, unit FROM inventory WHERE LOWER(name) LIKE $1 ORDER BY name LIMIT 10`,
+    `SELECT name, category, unit FROM (
+       SELECT name, category, unit, 1 AS priority FROM master_items WHERE LOWER(name) LIKE $1
+       UNION
+       SELECT DISTINCT name, category, unit, 2 AS priority FROM inventory WHERE LOWER(name) LIKE $1
+     ) combined
+     ORDER BY priority, name LIMIT 12`,
     [`%${q}%`]
   );
   res.json(rows);
 });
 
-// All distinct categories
+// All distinct categories (from master + inventory)
 app.get('/api/categories', auth, async (req, res) => {
-  const { rows } = await pool.query(`SELECT DISTINCT category FROM inventory WHERE category != '' ORDER BY category`);
+  const { rows } = await pool.query(
+    `SELECT DISTINCT category FROM (
+       SELECT category FROM master_items WHERE category != ''
+       UNION SELECT category FROM inventory WHERE category != ''
+     ) all_cats ORDER BY category`
+  );
   res.json(rows.map(r => r.category));
+});
+
+// Import master item list
+app.post('/api/master-items/import', auth, async (req, res) => {
+  const { items } = req.body;
+  if (!items || !items.length) return res.status(400).json({ error: 'No items provided' });
+  let inserted = 0;
+  // Process in batches of 200
+  for (let i = 0; i < items.length; i += 200) {
+    const batch = items.slice(i, i + 200);
+    const values = batch.map((item, idx) => {
+      const base = idx * 4;
+      return `($${base+1},$${base+2},$${base+3},$${base+4})`;
+    }).join(',');
+    const params = batch.flatMap(item => [item.name, item.alias||'', item.category||'', item.unit||'Pcs']);
+    await pool.query(
+      `INSERT INTO master_items (name, alias, category, unit) VALUES ${values} ON CONFLICT (name) DO UPDATE SET alias=EXCLUDED.alias, category=EXCLUDED.category, unit=EXCLUDED.unit`,
+      params
+    );
+    inserted += batch.length;
+  }
+  res.json({ message: `Imported ${inserted} items into master list` });
 });
 
 // Godowns

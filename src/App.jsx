@@ -51,6 +51,10 @@ const InventoryApp = () => {
   const [isExtracting, setIsExtracting] = useState(false);
   const [extractionError, setExtractionError] = useState('');
 
+  // Master item list
+  const [showMasterImport, setShowMasterImport] = useState(false);
+  const [masterImportStatus, setMasterImportStatus] = useState('');
+
   // Issue Slip
   const [showIssueSlip, setShowIssueSlip] = useState(false);
   const [slipItems, setSlipItems] = useState([]);
@@ -117,6 +121,49 @@ const InventoryApp = () => {
         document.head.appendChild(script);
       });
     }
+  };
+
+  const handleMasterImport = (file) => {
+    setMasterImportStatus('Reading file...');
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const text = e.target.result;
+      const lines = text.split('\n');
+      // Skip header rows — find the row with "Name" as first column
+      let startIdx = 0;
+      for (let i = 0; i < Math.min(10, lines.length); i++) {
+        if (lines[i].toLowerCase().includes('name') && lines[i].toLowerCase().includes('unit')) {
+          startIdx = i + 1; break;
+        }
+      }
+      const items = [];
+      for (let i = startIdx; i < lines.length; i++) {
+        const row = lines[i].split(',').map(v => v.trim().replace(/^"|"$/g, '').trim());
+        const name = row[0];
+        if (!name || name.length < 2) continue;
+        const alias = row[1] || '';
+        const category = row[2] || '';
+        const unit = (row[4] || 'Pcs').replace(/\.$/, ''); // strip trailing dot
+        items.push({ name, alias, category, unit });
+      }
+      setMasterImportStatus(`Uploading ${items.length} items...`);
+      try {
+        const res = await fetch('/api/master-items/import', {
+          method: 'POST', headers: authHeaders(),
+          body: JSON.stringify({ items })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          setMasterImportStatus(`✅ ${data.message}`);
+          await loadCategories();
+        } else {
+          setMasterImportStatus(`❌ Error: ${data.error}`);
+        }
+      } catch (err) {
+        setMasterImportStatus(`❌ Failed: ${err.message}`);
+      }
+    };
+    reader.readAsText(file);
   };
 
   const handleLogin = async (e) => {
@@ -359,6 +406,7 @@ const InventoryApp = () => {
       <div className="header">
         <div><h1>📦 Inventory Hub</h1><p>👤 {currentUser}</p></div>
         <div className="header-btns">
+          <button className="btn" style={{background:'#6d28d9',color:'white'}} onClick={()=>setShowMasterImport(!showMasterImport)}>📚 Item Master</button>
           <button className="btn btn-orange" onClick={()=>setShowIssueSlip(!showIssueSlip)}>📋 Issue Slip</button>
           <button className="btn btn-green" onClick={()=>setShowUpload(!showUpload)}>📤 Upload Bill</button>
           <button className="btn" style={{background:'#0891b2',color:'white'}} onClick={()=>setShowImport(!showImport)}>📊 Import CSV/XLS</button>
@@ -368,6 +416,32 @@ const InventoryApp = () => {
       </div>
 
       <div className="main">
+
+        {/* Master Item List Import */}
+        {showMasterImport && (
+          <div className="card" style={{border:'2px solid #6d28d9'}}>
+            <div className="card-title">📚 Item Master List</div>
+            <p style={{fontSize:13,color:'#64748b',marginBottom:14}}>
+              Upload your master item list CSV (Tally/Excel export). All item names will be available in autocomplete when adding stock. Expected columns: <strong>Name, Alias, Parent Group, Op. Stock, Unit</strong>
+            </p>
+            <label className="upload-box" style={{borderColor:'#a78bfa'}}>
+              <div className="upload-icon">📚</div>
+              <div style={{fontWeight:600,marginBottom:4}}>Tap to select your Item Master CSV</div>
+              <div style={{color:'#64748b',fontSize:13}}>Your DMPM_ListofItems.csv or any similar export</div>
+              <input type="file" accept=".csv,.txt" style={{display:'none'}}
+                onChange={e=>{ if(e.target.files[0]) handleMasterImport(e.target.files[0]); }} />
+            </label>
+            {masterImportStatus && (
+              <div style={{marginTop:12,padding:'10px 16px',borderRadius:8,
+                background: masterImportStatus.startsWith('✅') ? '#f0fdf4' : masterImportStatus.startsWith('❌') ? '#fef2f2' : '#f8fafc',
+                border: `1px solid ${masterImportStatus.startsWith('✅') ? '#86efac' : masterImportStatus.startsWith('❌') ? '#fecaca' : '#e2e8f0'}`,
+                color: masterImportStatus.startsWith('✅') ? '#166534' : masterImportStatus.startsWith('❌') ? '#dc2626' : '#475569',
+                fontWeight:600,fontSize:14}}>
+                {masterImportStatus}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Issue Slip */}
         {showIssueSlip && (
