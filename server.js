@@ -12,7 +12,6 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
-// Init tables
 const initDB = async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -31,18 +30,38 @@ const initDB = async () => {
     CREATE TABLE IF NOT EXISTS inventory (
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
-      quantity INTEGER NOT NULL,
+      quantity REAL NOT NULL DEFAULT 0,
+      unit TEXT DEFAULT 'pcs',
+      secondary_quantity REAL DEFAULT 0,
+      secondary_unit TEXT DEFAULT '',
       godown TEXT NOT NULL,
       date_added TEXT NOT NULL,
       added_by TEXT NOT NULL,
       price REAL DEFAULT 0,
       hsn TEXT DEFAULT 'N/A',
+      builty_number TEXT DEFAULT '',
+      transporter TEXT DEFAULT '',
+      remarks TEXT DEFAULT '',
+      stock_type TEXT DEFAULT 'regular',
       last_issued TEXT,
       issued_by TEXT
     );
   `);
 
-  // Seed default godowns
+  // Add new columns to existing table if they don't exist
+  const alterCols = [
+    "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS unit TEXT DEFAULT 'pcs'",
+    "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS secondary_quantity REAL DEFAULT 0",
+    "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS secondary_unit TEXT DEFAULT ''",
+    "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS builty_number TEXT DEFAULT ''",
+    "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS transporter TEXT DEFAULT ''",
+    "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS remarks TEXT DEFAULT ''",
+    "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS stock_type TEXT DEFAULT 'regular'",
+  ];
+  for (const sql of alterCols) {
+    try { await pool.query(sql); } catch(e) { /* ignore */ }
+  }
+
   const defaults = ['Godown-1','Godown-2','Godown-3','Godown-4','Godown-5'];
   for (const g of defaults) {
     await pool.query('INSERT INTO godowns (name) VALUES ($1) ON CONFLICT DO NOTHING', [g]);
@@ -51,13 +70,10 @@ const initDB = async () => {
 };
 
 app.use(cors());
-app.use(express.json());
-
-// Serve React frontend build
+app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'build')));
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'build', 'index.html')));
 
-// Auth middleware
 const auth = async (req, res, next) => {
   const token = req.headers['authorization'];
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
@@ -67,19 +83,16 @@ const auth = async (req, res, next) => {
   next();
 };
 
-// Signup
+// Auth
 app.post('/api/signup', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
   try {
     await pool.query('INSERT INTO users (email, password) VALUES ($1, $2)', [email, password]);
     res.json({ message: 'Account created! Now sign in.' });
-  } catch {
-    res.status(400).json({ error: 'Email already exists' });
-  }
+  } catch { res.status(400).json({ error: 'Email already exists' }); }
 });
 
-// Login
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
   const { rows } = await pool.query('SELECT * FROM users WHERE email = $1 AND password = $2', [email, password]);
@@ -89,41 +102,44 @@ app.post('/api/login', async (req, res) => {
   res.json({ token, email });
 });
 
-// Logout
 app.post('/api/logout', auth, async (req, res) => {
   await pool.query('DELETE FROM sessions WHERE token = $1', [req.headers['authorization']]);
   res.json({ message: 'Logged out' });
 });
 
-// Get inventory
+// Inventory
 app.get('/api/inventory', auth, async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM inventory ORDER BY id DESC');
   res.json(rows);
 });
 
-// Add single item
+const INV_FIELDS = `name, quantity, unit, secondary_quantity, secondary_unit, godown, date_added, added_by, price, hsn, builty_number, transporter, remarks, stock_type`;
+const INV_VALS  = `$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14`;
+
 app.post('/api/inventory', auth, async (req, res) => {
-  const { name, quantity, godown, dateAdded, price, hsn } = req.body;
+  const { name, quantity, unit, secondary_quantity, secondary_unit, godown, dateAdded, price, hsn, builty_number, transporter, remarks, stock_type } = req.body;
   const { rows } = await pool.query(
-    'INSERT INTO inventory (name, quantity, godown, date_added, added_by, price, hsn) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
-    [name, quantity, godown, dateAdded || new Date().toLocaleDateString(), req.user.email, price || 0, hsn || 'N/A']
+    `INSERT INTO inventory (${INV_FIELDS}) VALUES (${INV_VALS}) RETURNING *`,
+    [name, quantity||0, unit||'pcs', secondary_quantity||0, secondary_unit||'', godown,
+     dateAdded||new Date().toLocaleDateString(), req.user.email,
+     price||0, hsn||'N/A', builty_number||'', transporter||'', remarks||'', stock_type||'regular']
   );
   res.json(rows[0]);
 });
 
-// Bulk add
 app.post('/api/inventory/bulk', auth, async (req, res) => {
   const { items } = req.body;
   for (const item of items) {
     await pool.query(
-      'INSERT INTO inventory (name, quantity, godown, date_added, added_by, price, hsn) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-      [item.name, item.quantity, item.godown, item.dateAdded || new Date().toLocaleDateString(), req.user.email, item.price || 0, item.hsn || 'N/A']
+      `INSERT INTO inventory (${INV_FIELDS}) VALUES (${INV_VALS})`,
+      [item.name, item.quantity||0, item.unit||'pcs', item.secondary_quantity||0, item.secondary_unit||'',
+       item.godown, item.dateAdded||new Date().toLocaleDateString(), req.user.email,
+       item.price||0, item.hsn||'N/A', item.builty_number||'', item.transporter||'', item.remarks||'', item.stock_type||'regular']
     );
   }
   res.json({ message: `Added ${items.length} items` });
 });
 
-// Issue stock
 app.put('/api/inventory/:id/issue', auth, async (req, res) => {
   const { quantity } = req.body;
   const { rows } = await pool.query('SELECT * FROM inventory WHERE id = $1', [req.params.id]);
@@ -141,79 +157,68 @@ app.put('/api/inventory/:id/issue', auth, async (req, res) => {
   res.json(updated[0]);
 });
 
-// Delete item
 app.delete('/api/inventory/:id', auth, async (req, res) => {
   await pool.query('DELETE FROM inventory WHERE id = $1', [req.params.id]);
   res.json({ message: 'Deleted' });
 });
 
-// Get godowns
+// Godowns
 app.get('/api/godowns', auth, async (req, res) => {
   const { rows } = await pool.query('SELECT name FROM godowns ORDER BY id');
   res.json(rows.map(r => r.name));
 });
 
-// Add godown
 app.post('/api/godowns', auth, async (req, res) => {
   const { name } = req.body;
   try {
     await pool.query('INSERT INTO godowns (name) VALUES ($1)', [name]);
     res.json({ name });
-  } catch {
-    res.status(400).json({ error: 'Godown already exists' });
-  }
+  } catch { res.status(400).json({ error: 'Godown already exists' }); }
 });
 
-// Extract invoice data via Claude API (called from frontend)
+// Rename godown
+app.put('/api/godowns/:oldName', auth, async (req, res) => {
+  const { newName } = req.body;
+  const oldName = decodeURIComponent(req.params.oldName);
+  try {
+    await pool.query('UPDATE godowns SET name=$1 WHERE name=$2', [newName, oldName]);
+    await pool.query('UPDATE inventory SET godown=$1 WHERE godown=$2', [newName, oldName]);
+    res.json({ name: newName });
+  } catch { res.status(400).json({ error: 'Name already exists' }); }
+});
+
+// Delete godown
+app.delete('/api/godowns/:name', auth, async (req, res) => {
+  const name = decodeURIComponent(req.params.name);
+  await pool.query('DELETE FROM godowns WHERE name=$1', [name]);
+  res.json({ message: 'Deleted' });
+});
+
+// AI Extract
 app.post('/api/extract', auth, async (req, res) => {
   const { text, imageBase64, mediaType } = req.body;
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: 'Anthropic API key not configured' });
-
-  const prompt = `You are an invoice data extraction assistant. Extract all items from this invoice.
-For each item return: name, quantity (number), price (number or 0), hsn (string or "N/A").
-Return ONLY a valid JSON array like:
-[{"name":"A4 Paper","quantity":10,"price":500,"hsn":"4802"}]
+  const prompt = `Extract all items from this invoice. Return ONLY a JSON array:
+[{"name":"Item","quantity":10,"unit":"pcs","price":500,"hsn":"N/A","remarks":""}]
 No other text.`;
-
-  let messageContent;
-  if (imageBase64) {
-    messageContent = [
-      { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: imageBase64 } },
-      { type: 'text', text: prompt }
-    ];
-  } else {
-    messageContent = `${prompt}\n\nInvoice Text:\n${text}`;
-  }
-
+  let messageContent = imageBase64
+    ? [{ type:'image', source:{type:'base64', media_type:mediaType||'image/jpeg', data:imageBase64}}, {type:'text', text:prompt}]
+    : `${prompt}\n\nInvoice Text:\n${text}`;
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-opus-4-5',
-        max_tokens: 1000,
-        messages: [{ role: 'user', content: messageContent }]
-      })
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01'},
+      body: JSON.stringify({ model:'claude-opus-4-5', max_tokens:1000, messages:[{role:'user',content:messageContent}]})
     });
     const data = await response.json();
     if (!response.ok) return res.status(500).json({ error: data.error?.message || 'Claude API error' });
-    const content = data.content[0].text;
-    const match = content.match(/\[[\s\S]*\]/);
+    const match = data.content[0].text.match(/\[[\s\S]*\]/);
     if (!match) return res.status(500).json({ error: 'Could not parse response' });
     res.json({ items: JSON.parse(match[0]) });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 initDB().then(() => {
   app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
-}).catch(err => {
-  console.error('DB init failed:', err);
-  process.exit(1);
-});
+}).catch(err => { console.error('DB init failed:', err); process.exit(1); });
