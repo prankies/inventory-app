@@ -44,6 +44,14 @@ const InventoryApp = () => {
   const [isExtracting, setIsExtracting] = useState(false);
   const [extractionError, setExtractionError] = useState('');
 
+  // Issue Slip
+  const [showIssueSlip, setShowIssueSlip] = useState(false);
+  const [slipItems, setSlipItems] = useState([]);
+  const [slipSearch, setSlipSearch] = useState('');
+  const [slipIssuedTo, setSlipIssuedTo] = useState('');
+  const [slipRemarks, setSlipRemarks] = useState('');
+  const [issueSuccess, setIssueSuccess] = useState('');
+
   // CSV Import
   const [showImport, setShowImport] = useState(false);
   const [importFile, setImportFile] = useState(null);
@@ -132,6 +140,39 @@ const InventoryApp = () => {
     const data = await res.json();
     if (!res.ok) { alert(data.error); return; }
     await loadInventory();
+  };
+
+  // Issue Slip helpers
+  const slipSuggestions = slipSearch.length > 0
+    ? inventory.filter(i => i.name.toLowerCase().includes(slipSearch.toLowerCase()) && !slipItems.find(s => s.id === i.id)).slice(0, 8)
+    : [];
+
+  const addToSlip = (item) => {
+    setSlipItems(prev => [...prev, { id: item.id, name: item.name, available: item.quantity, unit: item.unit || 'pcs', godown: item.godown, issueQty: 1 }]);
+    setSlipSearch('');
+  };
+
+  const removeFromSlip = (id) => setSlipItems(prev => prev.filter(s => s.id !== id));
+
+  const updateSlipQty = (id, val) => setSlipItems(prev => prev.map(s => s.id === id ? { ...s, issueQty: val } : s));
+
+  const submitIssueSlip = async () => {
+    const invalid = slipItems.filter(s => !s.issueQty || parseFloat(s.issueQty) <= 0 || parseFloat(s.issueQty) > s.available);
+    if (invalid.length) { alert(`Check quantities — ${invalid.length} item(s) have invalid or excess quantities.`); return; }
+    if (!slipItems.length) { alert('Add at least one item to the slip.'); return; }
+    let errors = [];
+    for (const s of slipItems) {
+      const res = await fetch(`${API}/inventory/${s.id}/issue`, { method:'PUT', headers: authHeaders(), body: JSON.stringify({ quantity: parseFloat(s.issueQty), remarks: slipRemarks, issued_to: slipIssuedTo }) });
+      const data = await res.json();
+      if (!res.ok) errors.push(`${s.name}: ${data.error}`);
+    }
+    await loadInventory();
+    if (errors.length) { alert('Some items failed:\n' + errors.join('\n')); }
+    else {
+      setIssueSuccess(`✅ Issued ${slipItems.length} item(s) successfully!`);
+      setTimeout(() => setIssueSuccess(''), 4000);
+      setSlipItems([]); setSlipIssuedTo(''); setSlipRemarks('');
+    }
   };
 
   const deleteItem = async (id) => {
@@ -293,6 +334,7 @@ const InventoryApp = () => {
       <div className="header">
         <div><h1>📦 Inventory Hub</h1><p>👤 {currentUser}</p></div>
         <div className="header-btns">
+          <button className="btn btn-orange" onClick={()=>setShowIssueSlip(!showIssueSlip)}>📋 Issue Slip</button>
           <button className="btn btn-green" onClick={()=>setShowUpload(!showUpload)}>📤 Upload Bill</button>
           <button className="btn" style={{background:'#0891b2',color:'white'}} onClick={()=>setShowImport(!showImport)}>📊 Import CSV/XLS</button>
           <button className="btn btn-light" onClick={()=>setEditingGodowns(!editingGodowns)}>🏭 Godowns</button>
@@ -301,6 +343,107 @@ const InventoryApp = () => {
       </div>
 
       <div className="main">
+
+        {/* Issue Slip */}
+        {showIssueSlip && (
+          <div className="card" style={{border:'2px solid #ea580c'}}>
+            <div className="card-title">📋 Issue Slip — Bulk Issue</div>
+
+            {issueSuccess && <div style={{background:'#dcfce7',border:'1px solid #86efac',color:'#166534',borderRadius:8,padding:'10px 16px',marginBottom:14,fontWeight:600}}>{issueSuccess}</div>}
+
+            {/* Issued To + Remarks */}
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:14}}>
+              <div>
+                <label className="field-label">Issued To (optional)</label>
+                <input className="input" style={{marginBottom:0}} placeholder="Person / department name" value={slipIssuedTo} onChange={e=>setSlipIssuedTo(e.target.value)} />
+              </div>
+              <div>
+                <label className="field-label">Remarks (optional)</label>
+                <input className="input" style={{marginBottom:0}} placeholder="e.g. Production use, Dispatch..." value={slipRemarks} onChange={e=>setSlipRemarks(e.target.value)} />
+              </div>
+            </div>
+
+            {/* Search to add items */}
+            <div style={{position:'relative',marginBottom:14}}>
+              <label className="field-label">Search & Add Items</label>
+              <input
+                className="input" style={{marginBottom:0}}
+                placeholder="Type item name to search..."
+                value={slipSearch}
+                onChange={e=>setSlipSearch(e.target.value)}
+              />
+              {slipSuggestions.length > 0 && (
+                <div style={{position:'absolute',zIndex:100,left:0,right:0,background:'white',border:'1px solid #cbd5e1',borderRadius:8,boxShadow:'0 8px 24px rgba(0,0,0,0.12)',marginTop:4,maxHeight:260,overflowY:'auto'}}>
+                  {slipSuggestions.map(item => (
+                    <div key={item.id}
+                      onClick={()=>addToSlip(item)}
+                      style={{padding:'10px 16px',cursor:'pointer',borderBottom:'1px solid #f1f5f9',display:'flex',justifyContent:'space-between',alignItems:'center'}}
+                      onMouseEnter={e=>e.currentTarget.style.background='#f0f9ff'}
+                      onMouseLeave={e=>e.currentTarget.style.background='white'}
+                    >
+                      <div>
+                        <div style={{fontWeight:600}}>{item.name}</div>
+                        <div style={{fontSize:12,color:'#64748b'}}>{item.godown}</div>
+                      </div>
+                      <div style={{textAlign:'right'}}>
+                        <span style={{background:'#dbeafe',color:'#1d4ed8',padding:'2px 10px',borderRadius:20,fontSize:12,fontWeight:600}}>{item.quantity} {item.unit||'pcs'} avail.</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Slip table */}
+            {slipItems.length > 0 ? (
+              <>
+                <div className="table-wrap" style={{marginBottom:14}}>
+                  <table>
+                    <thead>
+                      <tr><th>#</th><th>Item</th><th>Godown</th><th>Available</th><th>Issue Qty</th><th></th></tr>
+                    </thead>
+                    <tbody>
+                      {slipItems.map((s, idx) => {
+                        const overLimit = parseFloat(s.issueQty) > s.available;
+                        return (
+                          <tr key={s.id} style={{background: overLimit ? '#fef2f2' : ''}}>
+                            <td style={{color:'#94a3b8',fontWeight:700}}>{idx+1}</td>
+                            <td style={{fontWeight:600}}>{s.name}</td>
+                            <td style={{color:'#64748b',fontSize:13}}>{s.godown}</td>
+                            <td><span style={{background:'#f1f5f9',padding:'2px 10px',borderRadius:20,fontWeight:600,fontSize:13}}>{s.available} {s.unit}</span></td>
+                            <td>
+                              <div style={{display:'flex',alignItems:'center',gap:6}}>
+                                <input
+                                  type="number" min="0.01" step="any"
+                                  value={s.issueQty}
+                                  onChange={e=>updateSlipQty(s.id, e.target.value)}
+                                  style={{width:80,padding:'6px 10px',border:`1.5px solid ${overLimit?'#ef4444':'#cbd5e1'}`,borderRadius:6,fontSize:14,fontWeight:600,textAlign:'center'}}
+                                />
+                                <span style={{fontSize:12,color:'#94a3b8'}}>{s.unit}</span>
+                                {overLimit && <span style={{color:'#ef4444',fontSize:11}}>⚠️ Exceeds stock</span>}
+                              </div>
+                            </td>
+                            <td><button className="btn btn-red btn-sm" onClick={()=>removeFromSlip(s.id)}>✕</button></td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <div style={{display:'flex',gap:10,alignItems:'center'}}>
+                  <button className="btn btn-orange" style={{flex:1,justifyContent:'center',padding:'11px',fontSize:'15px'}} onClick={submitIssueSlip}>
+                    📤 Issue All {slipItems.length} Item{slipItems.length>1?'s':''}
+                  </button>
+                  <button className="btn btn-gray" onClick={()=>setSlipItems([])}>🗑 Clear</button>
+                </div>
+              </>
+            ) : (
+              <div style={{textAlign:'center',padding:'24px',color:'#94a3b8',background:'#f8fafc',borderRadius:8,border:'1.5px dashed #cbd5e1'}}>
+                Search for items above to add them to this issue slip
+              </div>
+            )}
+          </div>
+        )}
 
         {/* CSV/XLS Import */}
         {showImport && (

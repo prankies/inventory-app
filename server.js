@@ -141,7 +141,7 @@ app.post('/api/inventory/bulk', auth, async (req, res) => {
 });
 
 app.put('/api/inventory/:id/issue', auth, async (req, res) => {
-  const { quantity } = req.body;
+  const { quantity, issued_to, remarks } = req.body;
   const { rows } = await pool.query('SELECT * FROM inventory WHERE id = $1', [req.params.id]);
   if (!rows.length) return res.status(404).json({ error: 'Item not found' });
   const newQty = rows[0].quantity - quantity;
@@ -152,7 +152,7 @@ app.put('/api/inventory/:id/issue', auth, async (req, res) => {
   }
   const { rows: updated } = await pool.query(
     'UPDATE inventory SET quantity=$1, last_issued=$2, issued_by=$3 WHERE id=$4 RETURNING *',
-    [newQty, new Date().toLocaleDateString(), req.user.email, req.params.id]
+    [newQty, new Date().toLocaleDateString(), issued_to ? `${req.user.email} → ${issued_to}` : req.user.email, req.params.id]
   );
   res.json(updated[0]);
 });
