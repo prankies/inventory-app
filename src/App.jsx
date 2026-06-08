@@ -27,6 +27,7 @@ const InventoryApp = () => {
   const [extractedData, setExtractedData] = useState([]);
   const [isExtracting, setIsExtracting] = useState(false);
   const [extractionError, setExtractionError] = useState('');
+  // eslint-disable-next-line no-unused-vars
   const [editingExtracted, setEditingExtracted] = useState(null);
 
   const headers = useCallback(() => ({
@@ -58,7 +59,7 @@ const InventoryApp = () => {
       loadInventory(savedToken);
       loadGodowns(savedToken);
     }
-  }, []);
+  }, [loadInventory, loadGodowns]);
 
   const loadPdfJs = async () => {
     if (!window.pdfjsLib) {
