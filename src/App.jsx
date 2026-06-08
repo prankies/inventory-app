@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Plus, Minus, Search, LogOut, Settings, Upload } from 'lucide-react';
 
-const API = 'http://localhost:4000/api';
+const API = '/api';
 
 const InventoryApp = () => {
   const [currentUser, setCurrentUser] = useState(null);

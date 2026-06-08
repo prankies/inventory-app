@@ -2,159 +2,171 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const path = require('path');
-const fs = require('fs');
+const { Pool } = require('pg');
 
 const app = express();
-const PORT = 4000;
-const DATA_DIR = path.join(__dirname, 'data');
+const PORT = process.env.PORT || 4000;
 
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+});
 
-const FILES = {
-  users: path.join(DATA_DIR, 'users.json'),
-  sessions: path.join(DATA_DIR, 'sessions.json'),
-  inventory: path.join(DATA_DIR, 'inventory.json'),
-  godowns: path.join(DATA_DIR, 'godowns.json'),
+// Init tables
+const initDB = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      email TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS godowns (
+      id SERIAL PRIMARY KEY,
+      name TEXT UNIQUE NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS inventory (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      quantity INTEGER NOT NULL,
+      godown TEXT NOT NULL,
+      date_added TEXT NOT NULL,
+      added_by TEXT NOT NULL,
+      price REAL DEFAULT 0,
+      hsn TEXT DEFAULT 'N/A',
+      last_issued TEXT,
+      issued_by TEXT
+    );
+  `);
+
+  // Seed default godowns
+  const defaults = ['Godown-1','Godown-2','Godown-3','Godown-4','Godown-5'];
+  for (const g of defaults) {
+    await pool.query('INSERT INTO godowns (name) VALUES ($1) ON CONFLICT DO NOTHING', [g]);
+  }
+  console.log('Database ready');
 };
-
-const read = (file, def) => {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return def; }
-};
-const write = (file, data) => fs.writeFileSync(file, JSON.stringify(data, null, 2));
-
-// Init defaults
-if (!fs.existsSync(FILES.godowns)) write(FILES.godowns, ['Godown-1','Godown-2','Godown-3','Godown-4','Godown-5']);
-if (!fs.existsSync(FILES.users)) write(FILES.users, {});
-if (!fs.existsSync(FILES.sessions)) write(FILES.sessions, {});
-if (!fs.existsSync(FILES.inventory)) write(FILES.inventory, []);
 
 app.use(cors());
 app.use(express.json());
 
-const auth = (req, res, next) => {
+// Serve React frontend build
+app.use(express.static(path.join(__dirname, 'build')));
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'build', 'index.html')));
+
+// Auth middleware
+const auth = async (req, res, next) => {
   const token = req.headers['authorization'];
-  const sessions = read(FILES.sessions, {});
-  if (!token || !sessions[token]) return res.status(401).json({ error: 'Unauthorized' });
-  req.user = sessions[token];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  const { rows } = await pool.query('SELECT * FROM sessions WHERE token = $1', [token]);
+  if (!rows.length) return res.status(401).json({ error: 'Invalid token' });
+  req.user = { email: rows[0].email };
   next();
 };
 
 // Signup
-app.post('/api/signup', (req, res) => {
+app.post('/api/signup', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-  const users = read(FILES.users, {});
-  if (users[email]) return res.status(400).json({ error: 'Email already exists' });
-  users[email] = password;
-  write(FILES.users, users);
-  res.json({ message: 'Account created! Now sign in.' });
+  try {
+    await pool.query('INSERT INTO users (email, password) VALUES ($1, $2)', [email, password]);
+    res.json({ message: 'Account created! Now sign in.' });
+  } catch {
+    res.status(400).json({ error: 'Email already exists' });
+  }
 });
 
 // Login
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
-  const users = read(FILES.users, {});
-  if (!users[email] || users[email] !== password) return res.status(401).json({ error: 'Invalid credentials' });
+  const { rows } = await pool.query('SELECT * FROM users WHERE email = $1 AND password = $2', [email, password]);
+  if (!rows.length) return res.status(401).json({ error: 'Invalid credentials' });
   const token = crypto.randomBytes(32).toString('hex');
-  const sessions = read(FILES.sessions, {});
-  sessions[token] = { email };
-  write(FILES.sessions, sessions);
+  await pool.query('INSERT INTO sessions (token, email) VALUES ($1, $2)', [token, email]);
   res.json({ token, email });
 });
 
 // Logout
-app.post('/api/logout', auth, (req, res) => {
-  const sessions = read(FILES.sessions, {});
-  delete sessions[req.headers['authorization']];
-  write(FILES.sessions, sessions);
+app.post('/api/logout', auth, async (req, res) => {
+  await pool.query('DELETE FROM sessions WHERE token = $1', [req.headers['authorization']]);
   res.json({ message: 'Logged out' });
 });
 
 // Get inventory
-app.get('/api/inventory', auth, (req, res) => {
-  res.json(read(FILES.inventory, []).reverse());
+app.get('/api/inventory', auth, async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM inventory ORDER BY id DESC');
+  res.json(rows);
 });
 
 // Add single item
-app.post('/api/inventory', auth, (req, res) => {
+app.post('/api/inventory', auth, async (req, res) => {
   const { name, quantity, godown, dateAdded, price, hsn } = req.body;
-  const inv = read(FILES.inventory, []);
-  const item = {
-    id: Date.now(),
-    name, quantity, godown,
-    date_added: dateAdded || new Date().toLocaleDateString(),
-    added_by: req.user.email,
-    price: price || 0,
-    hsn: hsn || 'N/A'
-  };
-  inv.push(item);
-  write(FILES.inventory, inv);
-  res.json(item);
+  const { rows } = await pool.query(
+    'INSERT INTO inventory (name, quantity, godown, date_added, added_by, price, hsn) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+    [name, quantity, godown, dateAdded || new Date().toLocaleDateString(), req.user.email, price || 0, hsn || 'N/A']
+  );
+  res.json(rows[0]);
 });
 
-// Bulk add (from PDF)
-app.post('/api/inventory/bulk', auth, (req, res) => {
+// Bulk add
+app.post('/api/inventory/bulk', auth, async (req, res) => {
   const { items } = req.body;
-  const inv = read(FILES.inventory, []);
-  const newItems = items.map(item => ({
-    id: Date.now() + Math.random(),
-    name: item.name,
-    quantity: item.quantity,
-    godown: item.godown,
-    date_added: item.dateAdded || new Date().toLocaleDateString(),
-    added_by: req.user.email,
-    price: item.price || 0,
-    hsn: item.hsn || 'N/A'
-  }));
-  inv.push(...newItems);
-  write(FILES.inventory, inv);
-  res.json({ message: `Added ${newItems.length} items` });
+  for (const item of items) {
+    await pool.query(
+      'INSERT INTO inventory (name, quantity, godown, date_added, added_by, price, hsn) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [item.name, item.quantity, item.godown, item.dateAdded || new Date().toLocaleDateString(), req.user.email, item.price || 0, item.hsn || 'N/A']
+    );
+  }
+  res.json({ message: `Added ${items.length} items` });
 });
 
 // Issue stock
-app.put('/api/inventory/:id/issue', auth, (req, res) => {
-  const id = parseFloat(req.params.id);
+app.put('/api/inventory/:id/issue', auth, async (req, res) => {
   const { quantity } = req.body;
-  let inv = read(FILES.inventory, []);
-  const idx = inv.findIndex(i => i.id === id);
-  if (idx === -1) return res.status(404).json({ error: 'Item not found' });
-  const newQty = inv[idx].quantity - quantity;
+  const { rows } = await pool.query('SELECT * FROM inventory WHERE id = $1', [req.params.id]);
+  if (!rows.length) return res.status(404).json({ error: 'Item not found' });
+  const newQty = rows[0].quantity - quantity;
   if (newQty < 0) return res.status(400).json({ error: 'Cannot issue more than available' });
   if (newQty === 0) {
-    inv.splice(idx, 1);
-    write(FILES.inventory, inv);
+    await pool.query('DELETE FROM inventory WHERE id = $1', [req.params.id]);
     return res.json({ deleted: true });
   }
-  inv[idx].quantity = newQty;
-  inv[idx].last_issued = new Date().toLocaleDateString();
-  inv[idx].issued_by = req.user.email;
-  write(FILES.inventory, inv);
-  res.json(inv[idx]);
+  const { rows: updated } = await pool.query(
+    'UPDATE inventory SET quantity=$1, last_issued=$2, issued_by=$3 WHERE id=$4 RETURNING *',
+    [newQty, new Date().toLocaleDateString(), req.user.email, req.params.id]
+  );
+  res.json(updated[0]);
 });
 
 // Delete item
-app.delete('/api/inventory/:id', auth, (req, res) => {
-  const id = parseFloat(req.params.id);
-  let inv = read(FILES.inventory, []);
-  write(FILES.inventory, inv.filter(i => i.id !== id));
+app.delete('/api/inventory/:id', auth, async (req, res) => {
+  await pool.query('DELETE FROM inventory WHERE id = $1', [req.params.id]);
   res.json({ message: 'Deleted' });
 });
 
 // Get godowns
-app.get('/api/godowns', auth, (req, res) => {
-  res.json(read(FILES.godowns, []));
+app.get('/api/godowns', auth, async (req, res) => {
+  const { rows } = await pool.query('SELECT name FROM godowns ORDER BY id');
+  res.json(rows.map(r => r.name));
 });
 
 // Add godown
-app.post('/api/godowns', auth, (req, res) => {
+app.post('/api/godowns', auth, async (req, res) => {
   const { name } = req.body;
-  const godowns = read(FILES.godowns, []);
-  if (godowns.includes(name)) return res.status(400).json({ error: 'Godown already exists' });
-  godowns.push(name);
-  write(FILES.godowns, godowns);
-  res.json({ name });
+  try {
+    await pool.query('INSERT INTO godowns (name) VALUES ($1)', [name]);
+    res.json({ name });
+  } catch {
+    res.status(400).json({ error: 'Godown already exists' });
+  }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Backend running at http://localhost:${PORT}`);
+initDB().then(() => {
+  app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+}).catch(err => {
+  console.error('DB init failed:', err);
+  process.exit(1);
 });
