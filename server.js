@@ -57,6 +57,7 @@ const initDB = async () => {
     "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS transporter TEXT DEFAULT ''",
     "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS remarks TEXT DEFAULT ''",
     "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS stock_type TEXT DEFAULT 'regular'",
+    "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS category TEXT DEFAULT ''",
   ];
   for (const sql of alterCols) {
     try { await pool.query(sql); } catch(e) { /* ignore */ }
@@ -113,16 +114,16 @@ app.get('/api/inventory', auth, async (req, res) => {
   res.json(rows);
 });
 
-const INV_FIELDS = `name, quantity, unit, secondary_quantity, secondary_unit, godown, date_added, added_by, price, hsn, builty_number, transporter, remarks, stock_type`;
-const INV_VALS  = `$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14`;
+const INV_FIELDS = `name, quantity, unit, secondary_quantity, secondary_unit, godown, date_added, added_by, price, hsn, builty_number, transporter, remarks, stock_type, category`;
+const INV_VALS  = `$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15`;
 
 app.post('/api/inventory', auth, async (req, res) => {
-  const { name, quantity, unit, secondary_quantity, secondary_unit, godown, dateAdded, price, hsn, builty_number, transporter, remarks, stock_type } = req.body;
+  const { name, quantity, unit, secondary_quantity, secondary_unit, godown, dateAdded, price, hsn, builty_number, transporter, remarks, stock_type, category } = req.body;
   const { rows } = await pool.query(
     `INSERT INTO inventory (${INV_FIELDS}) VALUES (${INV_VALS}) RETURNING *`,
     [name, quantity||0, unit||'pcs', secondary_quantity||0, secondary_unit||'', godown,
      dateAdded||new Date().toLocaleDateString(), req.user.email,
-     price||0, hsn||'N/A', builty_number||'', transporter||'', remarks||'', stock_type||'regular']
+     price||0, hsn||'N/A', builty_number||'', transporter||'', remarks||'', stock_type||'regular', category||'']
   );
   res.json(rows[0]);
 });
@@ -134,7 +135,7 @@ app.post('/api/inventory/bulk', auth, async (req, res) => {
       `INSERT INTO inventory (${INV_FIELDS}) VALUES (${INV_VALS})`,
       [item.name, item.quantity||0, item.unit||'pcs', item.secondary_quantity||0, item.secondary_unit||'',
        item.godown, item.dateAdded||new Date().toLocaleDateString(), req.user.email,
-       item.price||0, item.hsn||'N/A', item.builty_number||'', item.transporter||'', item.remarks||'', item.stock_type||'regular']
+       item.price||0, item.hsn||'N/A', item.builty_number||'', item.transporter||'', item.remarks||'', item.stock_type||'regular', item.category||'']
     );
   }
   res.json({ message: `Added ${items.length} items` });
@@ -160,6 +161,22 @@ app.put('/api/inventory/:id/issue', auth, async (req, res) => {
 app.delete('/api/inventory/:id', auth, async (req, res) => {
   await pool.query('DELETE FROM inventory WHERE id = $1', [req.params.id]);
   res.json({ message: 'Deleted' });
+});
+
+// Item name suggestions (autocomplete)
+app.get('/api/suggestions', auth, async (req, res) => {
+  const q = (req.query.q || '').toLowerCase();
+  const { rows } = await pool.query(
+    `SELECT DISTINCT name, category, unit FROM inventory WHERE LOWER(name) LIKE $1 ORDER BY name LIMIT 10`,
+    [`%${q}%`]
+  );
+  res.json(rows);
+});
+
+// All distinct categories
+app.get('/api/categories', auth, async (req, res) => {
+  const { rows } = await pool.query(`SELECT DISTINCT category FROM inventory WHERE category != '' ORDER BY category`);
+  res.json(rows.map(r => r.category));
 });
 
 // Godowns

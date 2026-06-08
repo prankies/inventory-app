@@ -28,7 +28,14 @@ const InventoryApp = () => {
   const [newTransporter, setNewTransporter] = useState('');
   const [newRemarks, setNewRemarks] = useState('');
   const [newStockType, setNewStockType] = useState('regular');
+  const [newCategory, setNewCategory] = useState('');
   const [showAddForm, setShowAddForm] = useState(true);
+
+  // Autocomplete
+  const [itemSuggestions, setItemSuggestions] = useState([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [categories, setCategories] = useState([]);
+  const [filterCategory, setFilterCategory] = useState('');
 
   // Godown management
   const [editingGodowns, setEditingGodowns] = useState(false);
@@ -77,14 +84,29 @@ const InventoryApp = () => {
     if (data.length > 0) { setNewGodown(data[0]); setSelectedGodown(data[0]); setImportGodown(data[0]); }
   }, [token]);
 
+  const loadCategories = useCallback(async (tok) => {
+    const t = tok || token;
+    const res = await fetch(`${API}/categories`, { headers: { Authorization: t } });
+    const data = await res.json();
+    setCategories(Array.isArray(data) ? data : []);
+  }, [token]);
+
+  const fetchSuggestions = async (q) => {
+    if (!q || q.length < 1) { setItemSuggestions([]); return; }
+    const res = await fetch(`${API}/suggestions?q=${encodeURIComponent(q)}`, { headers: { Authorization: token } });
+    const data = await res.json();
+    setItemSuggestions(Array.isArray(data) ? data : []);
+    setShowSuggestions(true);
+  };
+
   useEffect(() => {
     const savedToken = localStorage.getItem('inv_token');
     const savedUser = localStorage.getItem('inv_user');
     if (savedToken && savedUser) {
       setToken(savedToken); setCurrentUser(savedUser);
-      loadInventory(savedToken); loadGodowns(savedToken);
+      loadInventory(savedToken); loadGodowns(savedToken); loadCategories(savedToken);
     }
-  }, [loadInventory, loadGodowns]);
+  }, [loadInventory, loadGodowns, loadCategories]);
 
   const loadPdfJs = async () => {
     if (!window.pdfjsLib) {
@@ -104,7 +126,7 @@ const InventoryApp = () => {
     if (!res.ok) { setAuthError(data.error); return; }
     setToken(data.token); setCurrentUser(data.email);
     localStorage.setItem('inv_token', data.token); localStorage.setItem('inv_user', data.email);
-    await loadInventory(data.token); await loadGodowns(data.token);
+    await loadInventory(data.token); await loadGodowns(data.token); await loadCategories(data.token);
     setEmail(''); setPassword('');
   };
 
@@ -127,10 +149,10 @@ const InventoryApp = () => {
     if (!newItem || !newQty || !newGodown) return;
     await fetch(`${API}/inventory`, {
       method:'POST', headers: authHeaders(),
-      body: JSON.stringify({ name:newItem, quantity:parseFloat(newQty), unit:newUnit, secondary_quantity:parseFloat(newSecQty)||0, secondary_unit:newSecUnit, godown:newGodown, dateAdded:new Date().toLocaleDateString(), builty_number:newBuilty, transporter:newTransporter, remarks:newRemarks, stock_type:newStockType })
+      body: JSON.stringify({ name:newItem, quantity:parseFloat(newQty), unit:newUnit, secondary_quantity:parseFloat(newSecQty)||0, secondary_unit:newSecUnit, godown:newGodown, dateAdded:new Date().toLocaleDateString(), builty_number:newBuilty, transporter:newTransporter, remarks:newRemarks, stock_type:newStockType, category:newCategory })
     });
-    await loadInventory();
-    setNewItem(''); setNewQty(''); setNewSecQty(''); setNewBuilty(''); setNewTransporter(''); setNewRemarks('');
+    await loadInventory(); await loadCategories();
+    setNewItem(''); setNewQty(''); setNewSecQty(''); setNewBuilty(''); setNewTransporter(''); setNewRemarks(''); setNewCategory('');
   };
 
   const issueItem = async (id) => {
@@ -304,7 +326,10 @@ const InventoryApp = () => {
     a.click();
   };
 
-  const filtered = inventory.filter(i => i.name.toLowerCase().includes(searchTerm.toLowerCase()));
+  const filtered = inventory.filter(i =>
+    i.name.toLowerCase().includes(searchTerm.toLowerCase()) &&
+    (filterCategory === '' || i.category === filterCategory)
+  );
   const displayed = viewMode==='by-godown' ? filtered.filter(i => i.godown===selectedGodown) : filtered;
   const godownSummary = godowns.map(g => ({ name:g, items:inventory.filter(i=>i.godown===g).length, total:inventory.filter(i=>i.godown===g).reduce((s,i)=>s+i.quantity,0) }));
 
@@ -617,9 +642,28 @@ const InventoryApp = () => {
 
               {/* Row 1: Item, Qty, Unit, Sec Qty, Sec Unit */}
               <div style={{display:'grid',gridTemplateColumns:'2fr 1fr 1fr 1fr 1fr',gap:10,marginBottom:10}}>
-                <div>
+                <div style={{position:'relative'}}>
                   <label className="field-label">Item Name *</label>
-                  <input className="input" style={{marginBottom:0}} placeholder="Item name" value={newItem} onChange={e=>setNewItem(e.target.value)} required />
+                  <input className="input" style={{marginBottom:0}} placeholder="Item name" value={newItem}
+                    onChange={e=>{ setNewItem(e.target.value); fetchSuggestions(e.target.value); }}
+                    onBlur={()=>setTimeout(()=>setShowSuggestions(false),180)}
+                    onFocus={()=>newItem && fetchSuggestions(newItem)}
+                    autoComplete="off" required />
+                  {showSuggestions && itemSuggestions.length > 0 && (
+                    <div style={{position:'absolute',zIndex:200,left:0,right:0,background:'white',border:'1px solid #cbd5e1',borderRadius:8,boxShadow:'0 8px 20px rgba(0,0,0,0.12)',top:'100%',maxHeight:220,overflowY:'auto'}}>
+                      {itemSuggestions.map((s,i)=>(
+                        <div key={i}
+                          onMouseDown={()=>{ setNewItem(s.name); if(s.unit) setNewUnit(s.unit); if(s.category) setNewCategory(s.category); setShowSuggestions(false); }}
+                          style={{padding:'9px 14px',cursor:'pointer',borderBottom:'1px solid #f1f5f9',display:'flex',justifyContent:'space-between',alignItems:'center'}}
+                          onMouseEnter={e=>e.currentTarget.style.background='#f0f9ff'}
+                          onMouseLeave={e=>e.currentTarget.style.background='white'}
+                        >
+                          <span style={{fontWeight:600}}>{s.name}</span>
+                          <span style={{fontSize:12,color:'#94a3b8'}}>{s.category && <span style={{background:'#ede9fe',color:'#6d28d9',padding:'1px 7px',borderRadius:10,marginRight:6,fontSize:11}}>{s.category}</span>}{s.unit}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
                 <div>
                   <label className="field-label">Quantity *</label>
@@ -644,8 +688,17 @@ const InventoryApp = () => {
                 </div>
               </div>
 
-              {/* Row 2: Godown, Builty, Transporter, Remarks */}
-              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 2fr',gap:10,marginBottom:14}}>
+              {/* Row 2: Category, Godown, Builty, Transporter, Remarks */}
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr 2fr',gap:10,marginBottom:14}}>
+                <div>
+                  <label className="field-label">Category</label>
+                  <input className="input" style={{marginBottom:0}} placeholder="e.g. Paper, Ink..." value={newCategory}
+                    onChange={e=>setNewCategory(e.target.value)}
+                    list="category-list" />
+                  <datalist id="category-list">
+                    {categories.map(c=><option key={c} value={c}/>)}
+                  </datalist>
+                </div>
                 <div>
                   <label className="field-label">Godown *</label>
                   <select className="input" style={{marginBottom:0}} value={newGodown} onChange={e=>setNewGodown(e.target.value)}>
@@ -679,6 +732,12 @@ const InventoryApp = () => {
           <div className="toggle-row">
             <button className={`btn ${viewMode==='all'?'btn-blue':'btn-light'}`} onClick={()=>setViewMode('all')}>All Items</button>
             <button className={`btn ${viewMode==='by-godown'?'btn-blue':'btn-light'}`} onClick={()=>setViewMode('by-godown')}>By Godown</button>
+            {categories.length > 0 && (
+              <select className="input" style={{marginBottom:0,minWidth:130}} value={filterCategory} onChange={e=>setFilterCategory(e.target.value)}>
+                <option value="">All Categories</option>
+                {categories.map(c=><option key={c}>{c}</option>)}
+              </select>
+            )}
             <div className="search-wrap">
               <span className="search-icon">🔍</span>
               <input className="input" style={{marginBottom:0}} placeholder="Search items..." value={searchTerm} onChange={e=>setSearchTerm(e.target.value)} />
@@ -710,7 +769,7 @@ const InventoryApp = () => {
             <table>
               <thead>
                 <tr>
-                  <th>Item</th><th>Qty</th><th>Unit</th><th>Sec</th><th>Godown</th><th>Builty</th><th>Transporter</th><th>Remarks</th><th>Date</th><th>Type</th><th>Actions</th>
+                  <th>Item</th><th>Category</th><th>Qty</th><th>Unit</th><th>Sec</th><th>Godown</th><th>Builty</th><th>Transporter</th><th>Remarks</th><th>Date</th><th>Type</th><th>Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -719,6 +778,7 @@ const InventoryApp = () => {
                 ) : displayed.map(item=>(
                   <tr key={item.id}>
                     <td style={{fontWeight:600}}>{item.name}</td>
+                    <td>{item.category ? <span style={{background:'#ede9fe',color:'#6d28d9',padding:'2px 9px',borderRadius:20,fontSize:12,fontWeight:600}}>{item.category}</span> : <span style={{color:'#cbd5e1'}}>—</span>}</td>
                     <td><span className="badge">{item.quantity}</span></td>
                     <td style={{color:'#475569'}}>{item.unit||'pcs'}</td>
                     <td style={{color:'#94a3b8',fontSize:13}}>{item.secondary_quantity>0?`${item.secondary_quantity} ${item.secondary_unit}`:'-'}</td>
