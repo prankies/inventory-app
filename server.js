@@ -75,7 +75,7 @@ const initDB = async () => {
   for (const g of defaults) {
     await pool.query('INSERT INTO godowns (name) VALUES ($1) ON CONFLICT DO NOTHING', [g]);
   }
-  console.log('Database ready');
+  console.log('Database ready - v2.1');
 };
 
 app.use(cors());
@@ -161,7 +161,7 @@ app.put('/api/inventory/:id/issue', auth, async (req, res) => {
   }
   const { rows: updated } = await pool.query(
     'UPDATE inventory SET quantity=$1, last_issued=$2, issued_by=$3 WHERE id=$4 RETURNING *',
-    [newQty, new Date().toLocaleDateString(), issued_to ? `${req.user.email} → ${issued_to}` : req.user.email, req.params.id]
+    [newQty, new Date().toLocaleDateString(), issued_to ? `${req.user.email} â†’ ${issued_to}` : req.user.email, req.params.id]
   );
   res.json(updated[0]);
 });
@@ -171,7 +171,7 @@ app.delete('/api/inventory/:id', auth, async (req, res) => {
   res.json({ message: 'Deleted' });
 });
 
-// Item name suggestions (autocomplete) — searches master list + existing inventory
+// Item name suggestions (autocomplete) â€” searches master list + existing inventory
 app.get('/api/suggestions', auth, async (req, res) => {
   const q = (req.query.q || '').toLowerCase();
   const { rows } = await pool.query(
