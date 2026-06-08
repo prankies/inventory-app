@@ -279,3 +279,4 @@ No other text.`;
 initDB().then(() => {
   app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
 }).catch(err => { console.error('DB init failed:', err); process.exit(1); });
+ 
