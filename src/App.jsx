@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Plus, Minus, Search, LogOut, Settings, Upload } from 'lucide-react';
 
 const API = '/api';
 
@@ -22,14 +21,14 @@ const InventoryApp = () => {
   const [editingGodowns, setEditingGodowns] = useState(false);
   const [newGodownName, setNewGodownName] = useState('');
 
-  const [showPdfUpload, setShowPdfUpload] = useState(false);
+  const [showUpload, setShowUpload] = useState(false);
   const [uploadFile, setUploadFile] = useState(null);
   const [uploadMode, setUploadMode] = useState('pdf');
   const [extractedData, setExtractedData] = useState([]);
   const [isExtracting, setIsExtracting] = useState(false);
   const [extractionError, setExtractionError] = useState('');
 
-  const headers = useCallback(() => ({
+  const authHeaders = useCallback(() => ({
     'Content-Type': 'application/json',
     'Authorization': token
   }), [token]);
@@ -38,14 +37,14 @@ const InventoryApp = () => {
     const t = tok || token;
     const res = await fetch(`${API}/inventory`, { headers: { Authorization: t } });
     const data = await res.json();
-    setInventory(data);
+    setInventory(Array.isArray(data) ? data : []);
   }, [token]);
 
   const loadGodowns = useCallback(async (tok) => {
     const t = tok || token;
     const res = await fetch(`${API}/godowns`, { headers: { Authorization: t } });
     const data = await res.json();
-    setGodowns(data);
+    setGodowns(Array.isArray(data) ? data : []);
     if (data.length > 0) { setNewGodown(data[0]); setSelectedGodown(data[0]); }
   }, [token]);
 
@@ -74,8 +73,6 @@ const InventoryApp = () => {
     }
   };
 
-  useEffect(() => { loadPdfJs(); }, []);
-
   const handleSignUp = async (e) => {
     e.preventDefault();
     setAuthError('');
@@ -87,8 +84,7 @@ const InventoryApp = () => {
     const data = await res.json();
     if (!res.ok) { setAuthError(data.error); return; }
     alert('Account created! Now sign in.');
-    setIsLogin(true);
-    setEmail(''); setPassword('');
+    setIsLogin(true); setEmail(''); setPassword('');
   };
 
   const handleLogin = async (e) => {
@@ -101,8 +97,7 @@ const InventoryApp = () => {
     });
     const data = await res.json();
     if (!res.ok) { setAuthError(data.error); return; }
-    setToken(data.token);
-    setCurrentUser(data.email);
+    setToken(data.token); setCurrentUser(data.email);
     localStorage.setItem('inv_token', data.token);
     localStorage.setItem('inv_user', data.email);
     await loadInventory(data.token);
@@ -111,19 +106,14 @@ const InventoryApp = () => {
   };
 
   const handleLogout = async () => {
-    await fetch(`${API}/logout`, { method: 'POST', headers: headers() });
-    localStorage.removeItem('inv_token');
-    localStorage.removeItem('inv_user');
-    setCurrentUser(null);
-    setToken(null);
-    setInventory([]);
-    setGodowns([]);
+    await fetch(`${API}/logout`, { method: 'POST', headers: authHeaders() });
+    localStorage.removeItem('inv_token'); localStorage.removeItem('inv_user');
+    setCurrentUser(null); setToken(null); setInventory([]); setGodowns([]);
   };
 
   const handleExtract = async () => {
     if (!uploadFile) return;
-    setIsExtracting(true);
-    setExtractionError('');
+    setIsExtracting(true); setExtractionError('');
     try {
       let body;
       if (uploadFile.type === 'application/pdf') {
@@ -133,12 +123,11 @@ const InventoryApp = () => {
         let fullText = '';
         for (let i = 1; i <= pdf.numPages; i++) {
           const page = await pdf.getPage(i);
-          const textContent = await page.getTextContent();
-          fullText += textContent.items.map(item => item.str).join(' ') + '\n';
+          const tc = await page.getTextContent();
+          fullText += tc.items.map(x => x.str).join(' ') + '\n';
         }
         body = JSON.stringify({ text: fullText });
       } else {
-        // Image file — convert to base64
         const base64 = await new Promise((resolve) => {
           const reader = new FileReader();
           reader.onload = (e) => resolve(e.target.result.split(',')[1]);
@@ -146,7 +135,6 @@ const InventoryApp = () => {
         });
         body = JSON.stringify({ imageBase64: base64, mediaType: uploadFile.type });
       }
-
       const res = await fetch('/api/extract', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': token },
@@ -155,47 +143,40 @@ const InventoryApp = () => {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       setExtractedData(data.items.map((item, idx) => ({
-        ...item,
-        id: `temp_${idx}`,
-        godown: '',
+        ...item, id: `temp_${idx}`, godown: '',
         stockEntryDate: new Date().toISOString().split('T')[0],
         quantity: parseInt(item.quantity) || 1
       })));
-    } catch (error) {
-      setExtractionError('Failed to extract: ' + error.message);
+    } catch (err) {
+      setExtractionError('Failed: ' + err.message);
     } finally {
       setIsExtracting(false);
     }
   };
 
-  const updateExtractedItem = (id, field, value) => {
-    setExtractedData(extractedData.map(item => item.id === id ? { ...item, [field]: value } : item));
-  };
+  const updateExtracted = (id, field, value) =>
+    setExtractedData(extractedData.map(i => i.id === id ? { ...i, [field]: value } : i));
 
   const addExtractedItems = async () => {
-    const missing = extractedData.filter(item => !item.godown);
-    if (missing.length > 0) { alert(`Please select Godown for all items. Missing: ${missing.length}`); return; }
-    const res = await fetch(`${API}/inventory/bulk`, {
-      method: 'POST',
-      headers: headers(),
-      body: JSON.stringify({ items: extractedData.map(item => ({
-        name: item.name, quantity: item.quantity, godown: item.godown,
-        dateAdded: item.stockEntryDate, price: item.price || 0, hsn: item.hsn || 'N/A'
+    const missing = extractedData.filter(i => !i.godown);
+    if (missing.length) { alert(`Select godown for all items (${missing.length} missing)`); return; }
+    await fetch(`${API}/inventory/bulk`, {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({ items: extractedData.map(i => ({
+        name: i.name, quantity: i.quantity, godown: i.godown,
+        dateAdded: i.stockEntryDate, price: i.price || 0, hsn: i.hsn || 'N/A'
       }))})
     });
-    if (res.ok) {
-      await loadInventory();
-      setExtractedData([]); setUploadFile(null); setShowPdfUpload(false);
-      alert(`Added ${extractedData.length} items to inventory`);
-    }
+    await loadInventory();
+    setExtractedData([]); setUploadFile(null); setShowUpload(false);
+    alert(`Added ${extractedData.length} items!`);
   };
 
   const addItem = async (e) => {
     e.preventDefault();
     if (!newItem || !newQuantity || !newGodown) return;
     await fetch(`${API}/inventory`, {
-      method: 'POST',
-      headers: headers(),
+      method: 'POST', headers: authHeaders(),
       body: JSON.stringify({ name: newItem, quantity: parseInt(newQuantity), godown: newGodown, dateAdded: new Date().toLocaleDateString() })
     });
     await loadInventory();
@@ -203,12 +184,10 @@ const InventoryApp = () => {
   };
 
   const issueItem = async (id) => {
-    const issueQty = parseInt(window.prompt('How many to issue?', '1'));
-    if (!issueQty || issueQty <= 0) return;
+    const qty = parseInt(window.prompt('How many to issue?', '1'));
+    if (!qty || qty <= 0) return;
     const res = await fetch(`${API}/inventory/${id}/issue`, {
-      method: 'PUT',
-      headers: headers(),
-      body: JSON.stringify({ quantity: issueQty })
+      method: 'PUT', headers: authHeaders(), body: JSON.stringify({ quantity: qty })
     });
     const data = await res.json();
     if (!res.ok) { alert(data.error); return; }
@@ -217,7 +196,7 @@ const InventoryApp = () => {
 
   const deleteItem = async (id) => {
     if (!window.confirm('Delete this item?')) return;
-    await fetch(`${API}/inventory/${id}`, { method: 'DELETE', headers: headers() });
+    await fetch(`${API}/inventory/${id}`, { method: 'DELETE', headers: authHeaders() });
     await loadInventory();
   };
 
@@ -225,294 +204,229 @@ const InventoryApp = () => {
     e.preventDefault();
     if (!newGodownName) return;
     const res = await fetch(`${API}/godowns`, {
-      method: 'POST',
-      headers: headers(),
-      body: JSON.stringify({ name: newGodownName })
+      method: 'POST', headers: authHeaders(), body: JSON.stringify({ name: newGodownName })
     });
     if (res.ok) { await loadGodowns(); setNewGodownName(''); }
   };
 
   const exportCSV = () => {
     const csv = [
-      ['Item','Quantity','Godown','Date Added','Added By','Price','HSN'],
-      ...inventory.map(i => [i.name, i.quantity, i.godown, i.date_added, i.added_by, i.price || '', i.hsn || ''])
-    ].map(row => row.join(',')).join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const url = window.URL.createObjectURL(blob);
+      ['Item','Quantity','Godown','Date Added','Added By'],
+      ...inventory.map(i => [i.name, i.quantity, i.godown, i.date_added, i.added_by])
+    ].map(r => r.join(',')).join('\n');
     const a = document.createElement('a');
-    a.href = url;
+    a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
     a.download = `inventory_${new Date().toISOString().split('T')[0]}.csv`;
     a.click();
   };
 
-  const filteredInventory = inventory.filter(item =>
-    item.name.toLowerCase().includes(searchTerm.toLowerCase())
-  );
-  const godownInventory = viewMode === 'by-godown'
-    ? filteredInventory.filter(item => item.godown === selectedGodown)
-    : filteredInventory;
+  const filtered = inventory.filter(i => i.name.toLowerCase().includes(searchTerm.toLowerCase()));
+  const displayed = viewMode === 'by-godown' ? filtered.filter(i => i.godown === selectedGodown) : filtered;
   const godownSummary = godowns.map(g => ({
     name: g,
     items: inventory.filter(i => i.godown === g).length,
-    totalQty: inventory.filter(i => i.godown === g).reduce((sum, i) => sum + i.quantity, 0)
+    total: inventory.filter(i => i.godown === g).reduce((s, i) => s + i.quantity, 0)
   }));
 
+  // LOGIN SCREEN
   if (!currentUser) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-blue-600 to-blue-800 flex items-center justify-center p-4">
-        <div className="bg-white rounded-lg shadow-xl p-8 w-full max-w-md">
-          <h1 className="text-3xl font-bold text-center mb-2 text-blue-600">Inventory Hub</h1>
-          <p className="text-center text-gray-600 mb-8">PDF-Powered Stock Management</p>
+      <div className="login-wrap">
+        <div className="login-card">
+          <h1>📦 Inventory Hub</h1>
+          <p>Stock Management System</p>
           <form onSubmit={isLogin ? handleLogin : handleSignUp}>
-            <input type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)}
-              className="w-full mb-4 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
-            <input type="password" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)}
-              className="w-full mb-4 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
-            {authError && <p className="text-red-600 text-sm mb-3">{authError}</p>}
-            <button type="submit" className="w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg font-semibold mb-4">
-              {isLogin ? 'Sign In' : 'Create Account'}
+            <input className="input" type="email" placeholder="Email" value={email}
+              onChange={e => setEmail(e.target.value)} required />
+            <input className="input" type="password" placeholder="Password" value={password}
+              onChange={e => setPassword(e.target.value)} required />
+            {authError && <div className="alert-error">{authError}</div>}
+            <button className="btn btn-blue" style={{width:'100%', justifyContent:'center', padding:'11px', fontSize:'15px', marginBottom:'12px'}} type="submit">
+              {isLogin ? '🔐 Sign In' : '✅ Create Account'}
             </button>
           </form>
-          <button onClick={() => { setIsLogin(!isLogin); setAuthError(''); }} className="w-full text-blue-600 hover:underline">
-            {isLogin ? "Don't have account? Sign up" : 'Already have account? Sign in'}
+          <button onClick={() => { setIsLogin(!isLogin); setAuthError(''); }}
+            style={{width:'100%', background:'none', border:'none', color:'#2563eb', cursor:'pointer', fontSize:'14px'}}>
+            {isLogin ? "Don't have an account? Sign up" : 'Already have an account? Sign in'}
           </button>
         </div>
       </div>
     );
   }
 
+  // MAIN APP
   return (
-    <div className="min-h-screen bg-gray-50">
-      <div className="bg-blue-600 text-white sticky top-0 z-10 shadow-md">
-        <div className="max-w-6xl mx-auto px-4 py-4 flex justify-between items-center">
-          <div>
-            <h1 className="text-2xl font-bold">Inventory Hub</h1>
-            <p className="text-sm text-blue-100">Logged in: {currentUser}</p>
-          </div>
-          <div className="flex gap-2 flex-wrap">
-            <button onClick={() => setShowPdfUpload(!showPdfUpload)}
-              className="bg-green-600 hover:bg-green-700 px-3 py-2 rounded-lg flex items-center gap-2 text-sm">
-              <Upload size={18} /> Upload PDF
-            </button>
-            <button onClick={() => setEditingGodowns(!editingGodowns)}
-              className="bg-blue-700 hover:bg-blue-800 px-3 py-2 rounded-lg flex items-center gap-2 text-sm">
-              <Settings size={18} /> Godowns
-            </button>
-            <button onClick={handleLogout}
-              className="bg-red-600 hover:bg-red-700 px-3 py-2 rounded-lg flex items-center gap-2 text-sm">
-              <LogOut size={18} /> Sign Out
-            </button>
-          </div>
+    <div>
+      {/* Header */}
+      <div className="header">
+        <div>
+          <h1>📦 Inventory Hub</h1>
+          <p>👤 {currentUser}</p>
+        </div>
+        <div className="header-btns">
+          <button className="btn btn-green" onClick={() => setShowUpload(!showUpload)}>📤 Upload Bill</button>
+          <button className="btn btn-light" onClick={() => setEditingGodowns(!editingGodowns)}>🏭 Godowns</button>
+          <button className="btn btn-red" onClick={handleLogout}>🚪 Sign Out</button>
         </div>
       </div>
 
-      <div className="max-w-6xl mx-auto p-4">
+      <div className="main">
 
-        {showPdfUpload && (
-          <div className="bg-white rounded-lg shadow p-6 mb-6 border-2 border-green-300">
-            <h2 className="text-xl font-bold mb-4 flex items-center gap-2"><Upload size={20} /> Upload Invoice</h2>
+        {/* Upload / Camera section */}
+        {showUpload && (
+          <div className="card" style={{border: '2px solid #16a34a'}}>
+            <div className="card-title">📤 Upload Invoice / Bill</div>
             {!extractedData.length ? (
-              <div className="space-y-4">
-                {/* Mode tabs */}
-                <div className="flex gap-2 mb-2">
-                  <button onClick={() => { setUploadMode('pdf'); setUploadFile(null); }}
-                    className={`flex-1 py-2 rounded-lg font-semibold text-sm ${uploadMode === 'pdf' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700'}`}>
-                    📄 PDF File
-                  </button>
-                  <button onClick={() => { setUploadMode('camera'); setUploadFile(null); }}
-                    className={`flex-1 py-2 rounded-lg font-semibold text-sm ${uploadMode === 'camera' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700'}`}>
-                    📷 Camera / Image
-                  </button>
+              <>
+                <div className="mode-tabs">
+                  <button className={`mode-tab ${uploadMode==='pdf'?'active':''}`} onClick={() => { setUploadMode('pdf'); setUploadFile(null); }}>📄 PDF File</button>
+                  <button className={`mode-tab ${uploadMode==='camera'?'active':''}`} onClick={() => { setUploadMode('camera'); setUploadFile(null); }}>📷 Camera / Photo</button>
                 </div>
-
-                <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center">
-                  {uploadMode === 'pdf' ? (
-                    <>
-                      <input type="file" accept=".pdf" onChange={(e) => setUploadFile(e.target.files[0])} className="hidden" id="file-upload" />
-                      <label htmlFor="file-upload" className="cursor-pointer">
-                        <Upload size={40} className="mx-auto mb-2 text-gray-400" />
-                        <p className="text-gray-700 font-semibold">Tap to select PDF</p>
-                        <p className="text-sm text-gray-500">Supplier invoice PDF</p>
-                        {uploadFile && <p className="text-green-600 mt-2">✓ {uploadFile.name}</p>}
-                      </label>
-                    </>
-                  ) : (
-                    <>
-                      <input type="file" accept="image/*" capture="environment" onChange={(e) => setUploadFile(e.target.files[0])} className="hidden" id="camera-upload" />
-                      <label htmlFor="camera-upload" className="cursor-pointer">
-                        <div className="text-5xl mx-auto mb-2">📷</div>
-                        <p className="text-gray-700 font-semibold">Tap to open Camera</p>
-                        <p className="text-sm text-gray-500">or select image from gallery</p>
-                        {uploadFile && <p className="text-green-600 mt-2">✓ {uploadFile.name}</p>}
-                      </label>
-                    </>
-                  )}
-                </div>
-
-                {extractionError && <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">{extractionError}</div>}
-                <button onClick={() => uploadFile ? handleExtract() : alert('Please select a file')}
-                  disabled={!uploadFile || isExtracting}
-                  className={`w-full py-3 rounded-lg font-semibold flex items-center justify-center gap-2 ${isExtracting || !uploadFile ? 'bg-gray-400 cursor-not-allowed text-white' : 'bg-green-600 hover:bg-green-700 text-white'}`}>
-                  {isExtracting ? '🔄 Extracting with AI...' : '✨ Extract Items'}
+                <label className="upload-box">
+                  <div className="upload-icon">{uploadMode==='camera' ? '📷' : '📄'}</div>
+                  <div style={{fontWeight:600, marginBottom:4}}>
+                    {uploadMode==='camera' ? 'Tap to open Camera' : 'Tap to select PDF'}
+                  </div>
+                  <div style={{color:'#64748b', fontSize:13}}>
+                    {uploadMode==='camera' ? 'Take a photo of the bill' : 'Supplier invoice PDF'}
+                  </div>
+                  {uploadFile && <div style={{color:'#16a34a', marginTop:8, fontWeight:600}}>✓ {uploadFile.name}</div>}
+                  <input type="file"
+                    accept={uploadMode==='camera' ? 'image/*' : '.pdf'}
+                    capture={uploadMode==='camera' ? 'environment' : undefined}
+                    style={{display:'none'}}
+                    onChange={e => setUploadFile(e.target.files[0])} />
+                </label>
+                {extractionError && <div className="alert-error" style={{marginTop:10}}>{extractionError}</div>}
+                <button className="btn btn-green" disabled={!uploadFile || isExtracting}
+                  style={{width:'100%', justifyContent:'center', marginTop:12, padding:'11px'}}
+                  onClick={handleExtract}>
+                  {isExtracting ? '🔄 Extracting with AI...' : '✨ Extract Items with AI'}
                 </button>
-              </div>
+              </>
             ) : (
-              <div className="space-y-4">
-                <h3 className="font-bold text-lg">Extracted Items ({extractedData.length})</h3>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead className="bg-gray-100">
-                      <tr>
-                        <th className="px-3 py-2 text-left">Item Name</th>
-                        <th className="px-3 py-2 text-left">Qty</th>
-                        <th className="px-3 py-2 text-left">Price</th>
-                        <th className="px-3 py-2 text-left">Godown *</th>
-                        <th className="px-3 py-2 text-left">Entry Date *</th>
-                      </tr>
-                    </thead>
+              <>
+                <div style={{fontWeight:700, marginBottom:12}}>Extracted Items ({extractedData.length})</div>
+                <div className="table-wrap">
+                  <table>
+                    <thead><tr><th>Item</th><th>Qty</th><th>Godown</th><th>Date</th></tr></thead>
                     <tbody>
-                      {extractedData.map((item) => (
-                        <tr key={item.id} className="border-b border-gray-200">
-                          <td className="px-3 py-2">{item.name}</td>
-                          <td className="px-3 py-2">
-                            <input type="number" value={item.quantity}
-                              onChange={(e) => updateExtractedItem(item.id, 'quantity', parseInt(e.target.value))}
-                              className="w-20 px-2 py-1 border border-gray-300 rounded" />
-                          </td>
-                          <td className="px-3 py-2">{item.price || '-'}</td>
-                          <td className="px-3 py-2">
-                            <select value={item.godown} onChange={(e) => updateExtractedItem(item.id, 'godown', e.target.value)}
-                              className="px-2 py-1 border border-gray-300 rounded text-sm">
-                              <option value="">Select Godown</option>
+                      {extractedData.map(item => (
+                        <tr key={item.id}>
+                          <td>{item.name}</td>
+                          <td><input type="number" value={item.quantity} style={{width:70, padding:'4px 8px', border:'1px solid #cbd5e1', borderRadius:6}}
+                            onChange={e => updateExtracted(item.id, 'quantity', parseInt(e.target.value))} /></td>
+                          <td>
+                            <select value={item.godown} style={{padding:'4px 8px', border:'1px solid #cbd5e1', borderRadius:6}}
+                              onChange={e => updateExtracted(item.id, 'godown', e.target.value)}>
+                              <option value="">Select</option>
                               {godowns.map(g => <option key={g}>{g}</option>)}
                             </select>
                           </td>
-                          <td className="px-3 py-2">
-                            <input type="date" value={item.stockEntryDate}
-                              onChange={(e) => updateExtractedItem(item.id, 'stockEntryDate', e.target.value)}
-                              className="px-2 py-1 border border-gray-300 rounded text-sm" />
-                          </td>
+                          <td><input type="date" value={item.stockEntryDate} style={{padding:'4px 8px', border:'1px solid #cbd5e1', borderRadius:6}}
+                            onChange={e => updateExtracted(item.id, 'stockEntryDate', e.target.value)} /></td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
-                <div className="flex gap-3">
-                  <button onClick={addExtractedItems} className="flex-1 bg-green-600 hover:bg-green-700 text-white py-2 rounded-lg font-semibold">✓ Add All to Inventory</button>
-                  <button onClick={() => { setExtractedData([]); setUploadFile(null); }} className="flex-1 bg-gray-500 hover:bg-gray-600 text-white py-2 rounded-lg font-semibold">✕ Cancel</button>
+                <div style={{display:'flex', gap:10, marginTop:14}}>
+                  <button className="btn btn-green" style={{flex:1, justifyContent:'center'}} onClick={addExtractedItems}>✅ Add All to Inventory</button>
+                  <button className="btn btn-gray" style={{flex:1, justifyContent:'center'}} onClick={() => { setExtractedData([]); setUploadFile(null); }}>✕ Cancel</button>
                 </div>
-              </div>
+              </>
             )}
           </div>
         )}
 
+        {/* Godown Management */}
         {editingGodowns && (
-          <div className="bg-white rounded-lg shadow p-6 mb-6">
-            <h2 className="text-xl font-bold mb-4">Manage Godowns</h2>
-            <form onSubmit={addGodown} className="flex gap-2 mb-4">
-              <input type="text" placeholder="New godown name" value={newGodownName} onChange={(e) => setNewGodownName(e.target.value)}
-                className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
-              <button type="submit" className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg font-semibold">Add</button>
+          <div className="card">
+            <div className="card-title">🏭 Manage Godowns</div>
+            <form onSubmit={addGodown} style={{display:'flex', gap:10, marginBottom:14}}>
+              <input className="input" style={{marginBottom:0, flex:1}} placeholder="New godown name" value={newGodownName} onChange={e => setNewGodownName(e.target.value)} />
+              <button className="btn btn-green" type="submit">Add</button>
             </form>
-            <div className="flex flex-wrap gap-2">
-              {godowns.map(g => <span key={g} className="bg-blue-100 text-blue-800 px-3 py-1 rounded-lg text-sm">{g}</span>)}
-            </div>
+            <div>{godowns.map(g => <span key={g} className="tag">{g}</span>)}</div>
           </div>
         )}
 
-        <div className="bg-white rounded-lg shadow p-6 mb-6">
-          <h2 className="text-xl font-bold mb-4 flex items-center gap-2"><Plus size={20} /> Add Stock Manually</h2>
-          <form onSubmit={addItem} className="grid grid-cols-1 md:grid-cols-5 gap-3">
-            <input type="text" placeholder="Item name" value={newItem} onChange={(e) => setNewItem(e.target.value)}
-              className="px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
-            <input type="number" placeholder="Quantity" value={newQuantity} onChange={(e) => setNewQuantity(e.target.value)}
-              className="px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
-            <select value={newGodown} onChange={(e) => setNewGodown(e.target.value)}
-              className="px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+        {/* Add Item Form */}
+        <div className="card">
+          <div className="card-title">➕ Add Stock Manually</div>
+          <form onSubmit={addItem} className="add-form">
+            <input className="input" style={{marginBottom:0}} placeholder="Item name" value={newItem} onChange={e => setNewItem(e.target.value)} />
+            <input className="input" style={{marginBottom:0}} type="number" placeholder="Quantity" value={newQuantity} onChange={e => setNewQuantity(e.target.value)} />
+            <select className="input" style={{marginBottom:0}} value={newGodown} onChange={e => setNewGodown(e.target.value)}>
               {godowns.map(g => <option key={g}>{g}</option>)}
             </select>
-            <button type="submit" className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg font-semibold">Add Item</button>
-            <button type="button" onClick={exportCSV} className="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg font-semibold text-sm">Export CSV</button>
+            <button className="btn btn-green" type="submit">Add Item</button>
+            <button className="btn btn-purple" type="button" onClick={exportCSV}>Export CSV</button>
           </form>
         </div>
 
-        <div className="bg-white rounded-lg shadow p-4 mb-6">
-          <div className="flex gap-4 items-center">
-            <div className="flex gap-2">
-              <button onClick={() => setViewMode('all')}
-                className={`px-4 py-2 rounded-lg font-semibold ${viewMode === 'all' ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-800'}`}>All Items</button>
-              <button onClick={() => setViewMode('by-godown')}
-                className={`px-4 py-2 rounded-lg font-semibold ${viewMode === 'by-godown' ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-800'}`}>By Godown</button>
-            </div>
-            <div className="flex-1 relative">
-              <Search className="absolute left-3 top-3 text-gray-400" size={18} />
-              <input type="text" placeholder="Search items..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+        {/* View Toggle */}
+        <div className="card" style={{padding:'14px 20px'}}>
+          <div className="toggle-row">
+            <button className={`btn ${viewMode==='all'?'btn-blue':'btn-light'}`} onClick={() => setViewMode('all')}>All Items</button>
+            <button className={`btn ${viewMode==='by-godown'?'btn-blue':'btn-light'}`} onClick={() => setViewMode('by-godown')}>By Godown</button>
+            <div className="search-wrap">
+              <span className="search-icon">🔍</span>
+              <input className="input" style={{marginBottom:0}} placeholder="Search items..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} />
             </div>
           </div>
         </div>
 
+        {/* Godown Grid */}
         {viewMode === 'by-godown' && (
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
+          <div className="godown-grid">
             {godownSummary.map(g => (
-              <button key={g.name} onClick={() => setSelectedGodown(g.name)}
-                className={`p-4 rounded-lg font-semibold text-center transition ${selectedGodown === g.name ? 'bg-blue-600 text-white shadow-lg' : 'bg-white text-gray-800 border border-gray-200 hover:border-blue-400'}`}>
-                <div className="text-lg">{g.name}</div>
-                <div className="text-sm mt-1">{g.items} items</div>
-                <div className="text-sm mt-1">{g.totalQty} units</div>
+              <button key={g.name} className={`godown-btn ${selectedGodown===g.name?'active':''}`} onClick={() => setSelectedGodown(g.name)}>
+                {g.name}
+                <small>{g.items} items · {g.total} units</small>
               </button>
             ))}
           </div>
         )}
 
-        <div className="bg-white rounded-lg shadow overflow-hidden">
-          <div className="p-6 border-b border-gray-200">
-            <h2 className="text-xl font-bold">
-              {viewMode === 'by-godown' ? `${selectedGodown} - Stock` : 'All Stock'}
-              <span className="text-sm text-gray-600 ml-2">({godownInventory.length} items)</span>
-            </h2>
+        {/* Inventory Table */}
+        <div className="card" style={{padding:0, overflow:'hidden'}}>
+          <div style={{padding:'16px 20px', borderBottom:'1px solid #f1f5f9', display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+            <span style={{fontWeight:700, fontSize:17}}>
+              {viewMode==='by-godown' ? `${selectedGodown} — Stock` : 'All Stock'}
+              <span style={{color:'#64748b', fontWeight:400, fontSize:14, marginLeft:8}}>({displayed.length} items)</span>
+            </span>
+            <span style={{color:'#64748b', fontSize:13}}>{inventory.reduce((s,i)=>s+i.quantity,0)} total units</span>
           </div>
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead className="bg-gray-100 border-b border-gray-200">
-                <tr>
-                  <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Item</th>
-                  <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Qty</th>
-                  <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Godown</th>
-                  <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Date</th>
-                  <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Actions</th>
-                </tr>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Item</th><th>Qty</th><th>Godown</th><th>Date</th><th>Actions</th></tr>
               </thead>
               <tbody>
-                {godownInventory.length === 0 ? (
-                  <tr><td colSpan="5" className="px-6 py-8 text-center text-gray-500">No items found</td></tr>
-                ) : (
-                  godownInventory.map(item => (
-                    <tr key={item.id} className="border-b border-gray-200 hover:bg-gray-50">
-                      <td className="px-6 py-4 font-medium text-gray-900">{item.name}</td>
-                      <td className="px-6 py-4">
-                        <span className="bg-blue-100 text-blue-800 px-3 py-1 rounded-full font-bold">{item.quantity}</span>
-                      </td>
-                      <td className="px-6 py-4 text-gray-600">{item.godown}</td>
-                      <td className="px-6 py-4 text-sm text-gray-500">{item.date_added}</td>
-                      <td className="px-6 py-4 flex gap-2">
-                        <button onClick={() => issueItem(item.id)}
-                          className="bg-orange-600 hover:bg-orange-700 text-white px-3 py-1 rounded-lg text-sm flex items-center gap-1">
-                          <Minus size={16} /> Issue
-                        </button>
-                        <button onClick={() => deleteItem(item.id)}
-                          className="bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded-lg text-sm">Delete</button>
-                      </td>
-                    </tr>
-                  ))
-                )}
+                {displayed.length === 0 ? (
+                  <tr><td colSpan="5" style={{textAlign:'center', color:'#94a3b8', padding:'32px'}}>No items found</td></tr>
+                ) : displayed.map(item => (
+                  <tr key={item.id}>
+                    <td style={{fontWeight:600}}>{item.name}</td>
+                    <td><span className="badge">{item.quantity}</span></td>
+                    <td style={{color:'#475569'}}>{item.godown}</td>
+                    <td style={{color:'#94a3b8', fontSize:13}}>{item.date_added}</td>
+                    <td>
+                      <div className="actions">
+                        <button className="btn btn-orange btn-sm" onClick={() => issueItem(item.id)}>📤 Issue</button>
+                        <button className="btn btn-red btn-sm" onClick={() => deleteItem(item.id)}>🗑</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
         </div>
 
-        <div className="text-center text-gray-500 text-sm mt-8">
-          <p>Total items: <strong>{inventory.length}</strong> | Total units: <strong>{inventory.reduce((sum, i) => sum + i.quantity, 0)}</strong></p>
+        <div className="footer">
+          Total items: <strong>{inventory.length}</strong> &nbsp;|&nbsp; Total units: <strong>{inventory.reduce((s,i)=>s+i.quantity,0)}</strong>
         </div>
       </div>
     </div>
