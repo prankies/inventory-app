@@ -23,12 +23,11 @@ const InventoryApp = () => {
   const [newGodownName, setNewGodownName] = useState('');
 
   const [showPdfUpload, setShowPdfUpload] = useState(false);
-  const [pdfFile, setPdfFile] = useState(null);
+  const [uploadFile, setUploadFile] = useState(null);
+  const [uploadMode, setUploadMode] = useState('pdf');
   const [extractedData, setExtractedData] = useState([]);
   const [isExtracting, setIsExtracting] = useState(false);
   const [extractionError, setExtractionError] = useState('');
-  // eslint-disable-next-line no-unused-vars
-  const [editingExtracted, setEditingExtracted] = useState(null);
 
   const headers = useCallback(() => ({
     'Content-Type': 'application/json',
@@ -121,71 +120,49 @@ const InventoryApp = () => {
     setGodowns([]);
   };
 
-  const extractTextFromPdf = async (file) => {
+  const handleExtract = async () => {
+    if (!uploadFile) return;
+    setIsExtracting(true);
+    setExtractionError('');
     try {
-      setIsExtracting(true);
-      setExtractionError('');
-      await loadPdfJs();
-      const arrayBuffer = await file.arrayBuffer();
-      const pdf = await window.pdfjsLib.getDocument(arrayBuffer).promise;
-      let fullText = '';
-      for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        const text = await page.getTextContent();
-        fullText += text.items.map(item => item.str).join(' ') + '\n';
-      }
-      await extractDataWithClaude(fullText);
-    } catch (error) {
-      setExtractionError('Failed to extract PDF: ' + error.message);
-      setIsExtracting(false);
-    }
-  };
-
-  const extractDataWithClaude = async (pdfText) => {
-    try {
-      const prompt = `You are an invoice data extraction assistant. Extract items from this invoice/bill text.
-For each item found, extract:
-- Item name (product/item description)
-- Quantity (number of units)
-- Price per unit (if available)
-- HSN/SAC code (if visible, otherwise put "N/A")
-
-Return ONLY a JSON array like this:
-[{"name": "A4 Paper Bundle", "quantity": 10, "price": 500, "hsn": "4802"}]
-
-Invoice Text:
-${pdfText}
-
-Return valid JSON array only, no other text.`;
-
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1000,
-          messages: [{ role: 'user', content: prompt }]
-        })
-      });
-
-      if (!response.ok) throw new Error('Claude API error: ' + response.statusText);
-      const data = await response.json();
-      const content = data.content[0].text;
-      const jsonMatch = content.match(/\[[\s\S]*\]/);
-      if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        setExtractedData(parsed.map((item, idx) => ({
-          ...item,
-          id: `temp_${idx}`,
-          godown: '',
-          stockEntryDate: new Date().toISOString().split('T')[0],
-          quantity: parseInt(item.quantity) || 1
-        })));
+      let body;
+      if (uploadFile.type === 'application/pdf') {
+        await loadPdfJs();
+        const arrayBuffer = await uploadFile.arrayBuffer();
+        const pdf = await window.pdfjsLib.getDocument(arrayBuffer).promise;
+        let fullText = '';
+        for (let i = 1; i <= pdf.numPages; i++) {
+          const page = await pdf.getPage(i);
+          const textContent = await page.getTextContent();
+          fullText += textContent.items.map(item => item.str).join(' ') + '\n';
+        }
+        body = JSON.stringify({ text: fullText });
       } else {
-        throw new Error('Could not parse Claude response');
+        // Image file — convert to base64
+        const base64 = await new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onload = (e) => resolve(e.target.result.split(',')[1]);
+          reader.readAsDataURL(uploadFile);
+        });
+        body = JSON.stringify({ imageBase64: base64, mediaType: uploadFile.type });
       }
+
+      const res = await fetch('/api/extract', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': token },
+        body
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      setExtractedData(data.items.map((item, idx) => ({
+        ...item,
+        id: `temp_${idx}`,
+        godown: '',
+        stockEntryDate: new Date().toISOString().split('T')[0],
+        quantity: parseInt(item.quantity) || 1
+      })));
     } catch (error) {
-      setExtractionError('Failed to extract data: ' + error.message);
+      setExtractionError('Failed to extract: ' + error.message);
     } finally {
       setIsExtracting(false);
     }
@@ -208,7 +185,7 @@ Return valid JSON array only, no other text.`;
     });
     if (res.ok) {
       await loadInventory();
-      setExtractedData([]); setPdfFile(null); setShowPdfUpload(false);
+      setExtractedData([]); setUploadFile(null); setShowPdfUpload(false);
       alert(`Added ${extractedData.length} items to inventory`);
     }
   };
@@ -333,23 +310,50 @@ Return valid JSON array only, no other text.`;
 
         {showPdfUpload && (
           <div className="bg-white rounded-lg shadow p-6 mb-6 border-2 border-green-300">
-            <h2 className="text-xl font-bold mb-4 flex items-center gap-2"><Upload size={20} /> Upload Invoice PDF</h2>
+            <h2 className="text-xl font-bold mb-4 flex items-center gap-2"><Upload size={20} /> Upload Invoice</h2>
             {!extractedData.length ? (
               <div className="space-y-4">
-                <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center">
-                  <input type="file" accept=".pdf" onChange={(e) => setPdfFile(e.target.files[0])} className="hidden" id="pdf-upload" />
-                  <label htmlFor="pdf-upload" className="cursor-pointer">
-                    <Upload size={40} className="mx-auto mb-2 text-gray-400" />
-                    <p className="text-gray-700 font-semibold">Click to select PDF</p>
-                    <p className="text-sm text-gray-500">Supplier invoice PDF</p>
-                    {pdfFile && <p className="text-green-600 mt-2">✓ {pdfFile.name}</p>}
-                  </label>
+                {/* Mode tabs */}
+                <div className="flex gap-2 mb-2">
+                  <button onClick={() => { setUploadMode('pdf'); setUploadFile(null); }}
+                    className={`flex-1 py-2 rounded-lg font-semibold text-sm ${uploadMode === 'pdf' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700'}`}>
+                    📄 PDF File
+                  </button>
+                  <button onClick={() => { setUploadMode('camera'); setUploadFile(null); }}
+                    className={`flex-1 py-2 rounded-lg font-semibold text-sm ${uploadMode === 'camera' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700'}`}>
+                    📷 Camera / Image
+                  </button>
                 </div>
+
+                <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center">
+                  {uploadMode === 'pdf' ? (
+                    <>
+                      <input type="file" accept=".pdf" onChange={(e) => setUploadFile(e.target.files[0])} className="hidden" id="file-upload" />
+                      <label htmlFor="file-upload" className="cursor-pointer">
+                        <Upload size={40} className="mx-auto mb-2 text-gray-400" />
+                        <p className="text-gray-700 font-semibold">Tap to select PDF</p>
+                        <p className="text-sm text-gray-500">Supplier invoice PDF</p>
+                        {uploadFile && <p className="text-green-600 mt-2">✓ {uploadFile.name}</p>}
+                      </label>
+                    </>
+                  ) : (
+                    <>
+                      <input type="file" accept="image/*" capture="environment" onChange={(e) => setUploadFile(e.target.files[0])} className="hidden" id="camera-upload" />
+                      <label htmlFor="camera-upload" className="cursor-pointer">
+                        <div className="text-5xl mx-auto mb-2">📷</div>
+                        <p className="text-gray-700 font-semibold">Tap to open Camera</p>
+                        <p className="text-sm text-gray-500">or select image from gallery</p>
+                        {uploadFile && <p className="text-green-600 mt-2">✓ {uploadFile.name}</p>}
+                      </label>
+                    </>
+                  )}
+                </div>
+
                 {extractionError && <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">{extractionError}</div>}
-                <button onClick={() => pdfFile ? extractTextFromPdf(pdfFile) : alert('Please select a PDF')}
-                  disabled={!pdfFile || isExtracting}
-                  className={`w-full py-3 rounded-lg font-semibold flex items-center justify-center gap-2 ${isExtracting || !pdfFile ? 'bg-gray-400 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700 text-white'}`}>
-                  {isExtracting ? '🔄 Extracting...' : '📄 Extract Items'}
+                <button onClick={() => uploadFile ? handleExtract() : alert('Please select a file')}
+                  disabled={!uploadFile || isExtracting}
+                  className={`w-full py-3 rounded-lg font-semibold flex items-center justify-center gap-2 ${isExtracting || !uploadFile ? 'bg-gray-400 cursor-not-allowed text-white' : 'bg-green-600 hover:bg-green-700 text-white'}`}>
+                  {isExtracting ? '🔄 Extracting with AI...' : '✨ Extract Items'}
                 </button>
               </div>
             ) : (
@@ -395,7 +399,7 @@ Return valid JSON array only, no other text.`;
                 </div>
                 <div className="flex gap-3">
                   <button onClick={addExtractedItems} className="flex-1 bg-green-600 hover:bg-green-700 text-white py-2 rounded-lg font-semibold">✓ Add All to Inventory</button>
-                  <button onClick={() => { setExtractedData([]); setPdfFile(null); }} className="flex-1 bg-gray-500 hover:bg-gray-600 text-white py-2 rounded-lg font-semibold">✕ Cancel</button>
+                  <button onClick={() => { setExtractedData([]); setUploadFile(null); }} className="flex-1 bg-gray-500 hover:bg-gray-600 text-white py-2 rounded-lg font-semibold">✕ Cancel</button>
                 </div>
               </div>
             )}

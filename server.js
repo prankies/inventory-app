@@ -164,6 +164,53 @@ app.post('/api/godowns', auth, async (req, res) => {
   }
 });
 
+// Extract invoice data via Claude API (called from frontend)
+app.post('/api/extract', auth, async (req, res) => {
+  const { text, imageBase64, mediaType } = req.body;
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'Anthropic API key not configured' });
+
+  const prompt = `You are an invoice data extraction assistant. Extract all items from this invoice.
+For each item return: name, quantity (number), price (number or 0), hsn (string or "N/A").
+Return ONLY a valid JSON array like:
+[{"name":"A4 Paper","quantity":10,"price":500,"hsn":"4802"}]
+No other text.`;
+
+  let messageContent;
+  if (imageBase64) {
+    messageContent = [
+      { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: imageBase64 } },
+      { type: 'text', text: prompt }
+    ];
+  } else {
+    messageContent = `${prompt}\n\nInvoice Text:\n${text}`;
+  }
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-4-5',
+        max_tokens: 1000,
+        messages: [{ role: 'user', content: messageContent }]
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) return res.status(500).json({ error: data.error?.message || 'Claude API error' });
+    const content = data.content[0].text;
+    const match = content.match(/\[[\s\S]*\]/);
+    if (!match) return res.status(500).json({ error: 'Could not parse response' });
+    res.json({ items: JSON.parse(match[0]) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 initDB().then(() => {
   app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
 }).catch(err => {
