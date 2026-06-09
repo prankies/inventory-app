@@ -146,18 +146,20 @@ const InventoryApp = () => {
         const unit = (row[4] || 'Pcs').replace(/\.$/, ''); // strip trailing dot
         items.push({ name, alias, category, unit });
       }
-      setMasterImportStatus(`Uploading ${items.length} items...`);
+      setMasterImportStatus(`⏳ Uploading ${items.length} items to database...`);
       try {
         const res = await fetch('/api/master-items/import', {
           method: 'POST', headers: authHeaders(),
           body: JSON.stringify({ items })
         });
-        const data = await res.json();
+        const text = await res.text();
+        let data;
+        try { data = JSON.parse(text); } catch(e) { throw new Error('Server error: ' + text.substring(0,100)); }
         if (res.ok) {
-          setMasterImportStatus(`✅ ${data.message}`);
+          setMasterImportStatus(`✅ ${data.message} — autocomplete is ready!`);
           await loadCategories();
         } else {
-          setMasterImportStatus(`❌ Error: ${data.error}`);
+          setMasterImportStatus(`❌ Error: ${data.error || 'Unknown error'}`);
         }
       } catch (err) {
         setMasterImportStatus(`❌ Failed: ${err.message}`);

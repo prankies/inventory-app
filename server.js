@@ -199,24 +199,25 @@ app.get('/api/categories', auth, async (req, res) => {
 
 // Import master item list
 app.post('/api/master-items/import', auth, async (req, res) => {
-  const { items } = req.body;
-  if (!items || !items.length) return res.status(400).json({ error: 'No items provided' });
-  let inserted = 0;
-  // Process in batches of 200
-  for (let i = 0; i < items.length; i += 200) {
-    const batch = items.slice(i, i + 200);
-    const values = batch.map((item, idx) => {
-      const base = idx * 4;
-      return `($${base+1},$${base+2},$${base+3},$${base+4})`;
-    }).join(',');
-    const params = batch.flatMap(item => [item.name, item.alias||'', item.category||'', item.unit||'Pcs']);
-    await pool.query(
-      `INSERT INTO master_items (name, alias, category, unit) VALUES ${values} ON CONFLICT (name) DO UPDATE SET alias=EXCLUDED.alias, category=EXCLUDED.category, unit=EXCLUDED.unit`,
-      params
-    );
-    inserted += batch.length;
+  try {
+    const { items } = req.body;
+    if (!items || !items.length) return res.status(400).json({ error: 'No items provided' });
+    let inserted = 0;
+    // Process one at a time to avoid parameter limit issues
+    for (const item of items) {
+      if (!item.name || item.name.trim().length < 1) continue;
+      await pool.query(
+        `INSERT INTO master_items (name, alias, category, unit) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (name) DO UPDATE SET alias=EXCLUDED.alias, category=EXCLUDED.category, unit=EXCLUDED.unit`,
+        [item.name.trim(), item.alias||'', item.category||'', item.unit||'Pcs']
+      );
+      inserted++;
+    }
+    res.json({ message: `Imported ${inserted} items into master list` });
+  } catch (err) {
+    console.error('Master import error:', err.message);
+    res.status(500).json({ error: err.message });
   }
-  res.json({ message: `Imported ${inserted} items into master list` });
 });
 
 // Godowns
