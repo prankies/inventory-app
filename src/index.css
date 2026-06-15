@@ -81,6 +81,22 @@ body {
 }
 .input:focus { border-color: #2563eb; }
 
+/* Field labels */
+.field-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  color: #64748b;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Form grid layouts */
+.form-row-5a { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+.form-row-5b { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr 2fr; gap: 10px; margin-bottom: 14px; }
+.form-row-2  { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+
 /* Cards */
 .card {
   background: white;
@@ -101,22 +117,11 @@ body {
 /* Main content */
 .main { max-width: 1000px; margin: 0 auto; padding: 16px; }
 
-/* Add stock form */
-.add-form {
-  display: grid;
-  grid-template-columns: 1fr 1fr auto auto auto;
-  gap: 10px;
-  align-items: center;
-}
-@media (max-width: 640px) {
-  .add-form { grid-template-columns: 1fr 1fr; }
-}
-
 /* Table */
-.table-wrap { overflow-x: auto; }
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 table { width: 100%; border-collapse: collapse; }
 thead { background: #f8fafc; }
-th { padding: 10px 14px; text-align: left; font-size: 13px; color: #475569; border-bottom: 2px solid #e2e8f0; }
+th { padding: 10px 14px; text-align: left; font-size: 13px; color: #475569; border-bottom: 2px solid #e2e8f0; white-space: nowrap; }
 td { padding: 12px 14px; border-bottom: 1px solid #f1f5f9; font-size: 14px; }
 tr:hover td { background: #f8fafc; }
 
@@ -168,6 +173,7 @@ tr:hover td { background: #f8fafc; }
   text-align: center;
   cursor: pointer;
   transition: border 0.2s;
+  display: block;
 }
 .upload-box:hover { border-color: #2563eb; }
 .upload-icon { font-size: 40px; margin-bottom: 10px; }
@@ -191,3 +197,25 @@ tr:hover td { background: #f8fafc; }
 .footer { text-align: center; color: #94a3b8; font-size: 13px; margin-top: 24px; padding-bottom: 24px; }
 
 select.input { cursor: pointer; }
+
+/* ── Mobile responsive ── */
+@media (max-width: 640px) {
+  .header { padding: 10px 12px; gap: 6px; }
+  .header h1 { font-size: 17px; }
+  .header p { display: none; }
+  .header-btns { gap: 5px; }
+  .header-btns .btn { padding: 6px 8px; font-size: 11px; gap: 2px; }
+
+  .main { padding: 10px; }
+  .card { padding: 14px; }
+  .card-title { font-size: 15px; }
+
+  .form-row-5a { grid-template-columns: 1fr 1fr; }
+  .form-row-5b { grid-template-columns: 1fr 1fr; }
+  .form-row-2  { grid-template-columns: 1fr; }
+
+  .toggle-row { gap: 6px; }
+  .search-wrap { min-width: 120px; }
+
+  th, td { padding: 8px 10px; font-size: 12px; }
+}

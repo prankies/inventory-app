@@ -453,7 +453,7 @@ const InventoryApp = () => {
             {issueSuccess && <div style={{background:'#dcfce7',border:'1px solid #86efac',color:'#166534',borderRadius:8,padding:'10px 16px',marginBottom:14,fontWeight:600}}>{issueSuccess}</div>}
 
             {/* Issued To + Remarks */}
-            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:14}}>
+            <div className='form-row-2'>
               <div>
                 <label className="field-label">Issued To (optional)</label>
                 <input className="input" style={{marginBottom:0}} placeholder="Person / department name" value={slipIssuedTo} onChange={e=>setSlipIssuedTo(e.target.value)} />
@@ -717,7 +717,7 @@ const InventoryApp = () => {
               </div>
 
               {/* Row 1: Item, Qty, Unit, Sec Qty, Sec Unit */}
-              <div style={{display:'grid',gridTemplateColumns:'2fr 1fr 1fr 1fr 1fr',gap:10,marginBottom:10}}>
+              <div className='form-row-5a'>
                 <div style={{position:'relative'}}>
                   <label className="field-label">Item Name *</label>
                   <input className="input" style={{marginBottom:0}} placeholder="Item name" value={newItem}
@@ -765,7 +765,7 @@ const InventoryApp = () => {
               </div>
 
               {/* Row 2: Category, Godown, Builty, Transporter, Remarks */}
-              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr 2fr',gap:10,marginBottom:14}}>
+              <div className='form-row-5b'>
                 <div>
                   <label className="field-label">Category</label>
                   <input className="input" style={{marginBottom:0}} placeholder="e.g. Paper, Ink..." value={newCategory}
