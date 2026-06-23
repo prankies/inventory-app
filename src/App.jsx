@@ -63,6 +63,17 @@ const InventoryApp = () => {
   const [slipRemarks, setSlipRemarks] = useState('');
   const [issueSuccess, setIssueSuccess] = useState('');
 
+  // Transfer Stock
+  const [showTransfer, setShowTransfer] = useState(false);
+  const [transferSearch, setTransferSearch] = useState('');
+  const [transferItem, setTransferItem] = useState(null);
+  const [transferFromGodown, setTransferFromGodown] = useState('');
+  const [transferToGodown, setTransferToGodown] = useState('');
+  const [transferQty, setTransferQty] = useState('');
+  const [transferRemarks, setTransferRemarks] = useState('');
+  const [transferError, setTransferError] = useState('');
+  const [transferSuccess, setTransferSuccess] = useState('');
+
   // CSV Import
   const [showImport, setShowImport] = useState(false);
   const [importFile, setImportFile] = useState(null);
@@ -246,6 +257,48 @@ const InventoryApp = () => {
     }
   };
 
+  // Transfer Stock helpers
+  const transferSuggestions = transferSearch.length > 0 && !transferItem
+    ? Array.from(new Map(inventory.filter(i => i.quantity > 0 && i.name.toLowerCase().includes(transferSearch.toLowerCase())).map(i => [i.name, i])).values()).slice(0, 8)
+    : [];
+
+  const transferSourceGodowns = transferItem
+    ? inventory.filter(i => i.name === transferItem.name && i.quantity > 0)
+    : [];
+
+  const pickTransferItem = (item) => {
+    setTransferItem(item);
+    setTransferSearch(item.name);
+    setTransferFromGodown(item.godown);
+    setTransferToGodown('');
+    setTransferQty('');
+    setTransferError('');
+  };
+
+  const transferAvailableQty = transferItem
+    ? (inventory.find(i => i.name === transferItem.name && i.godown === transferFromGodown)?.quantity || 0)
+    : 0;
+
+  const submitTransfer = async () => {
+    setTransferError('');
+    const qty = parseFloat(transferQty);
+    if (!transferItem || !transferFromGodown || !transferToGodown) { setTransferError('Select item, source and destination godown.'); return; }
+    if (transferFromGodown === transferToGodown) { setTransferError('Source and destination godown must be different.'); return; }
+    if (!qty || qty <= 0) { setTransferError('Enter a valid quantity.'); return; }
+    if (qty > transferAvailableQty) { setTransferError(`Only ${transferAvailableQty} available in ${transferFromGodown}.`); return; }
+
+    const res = await fetch(`${API}/inventory/transfer`, {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({ name: transferItem.name, fromGodown: transferFromGodown, toGodown: transferToGodown, quantity: qty, remarks: transferRemarks })
+    });
+    const data = await res.json();
+    if (!res.ok) { setTransferError(data.error); return; }
+    await loadInventory();
+    setTransferSuccess(`✅ ${data.message}`);
+    setTimeout(() => setTransferSuccess(''), 4000);
+    setTransferItem(null); setTransferSearch(''); setTransferFromGodown(''); setTransferToGodown(''); setTransferQty(''); setTransferRemarks('');
+  };
+
   const deleteItem = async (id) => {
     if (!window.confirm('Delete this item?')) return;
     await fetch(`${API}/inventory/${id}`, { method:'DELETE', headers: authHeaders() });
@@ -410,6 +463,7 @@ const InventoryApp = () => {
         <div className="header-btns">
           <button className="btn" style={{background:'#6d28d9',color:'white'}} onClick={()=>setShowMasterImport(!showMasterImport)}>📚 Item Master</button>
           <button className="btn btn-orange" onClick={()=>setShowIssueSlip(!showIssueSlip)}>📋 Issue Slip</button>
+          <button className="btn" style={{background:'#0d9488',color:'white'}} onClick={()=>setShowTransfer(!showTransfer)}>🔄 Transfer</button>
           <button className="btn btn-green" onClick={()=>setShowUpload(!showUpload)}>📤 Upload Bill</button>
           <button className="btn" style={{background:'#0891b2',color:'white'}} onClick={()=>setShowImport(!showImport)}>📊 Import CSV/XLS</button>
           <button className="btn btn-light" onClick={()=>setEditingGodowns(!editingGodowns)}>🏭 Godowns</button>
@@ -542,6 +596,74 @@ const InventoryApp = () => {
               <div style={{textAlign:'center',padding:'24px',color:'#94a3b8',background:'#f8fafc',borderRadius:8,border:'1.5px dashed #cbd5e1'}}>
                 Search for items above to add them to this issue slip
               </div>
+            )}
+          </div>
+        )}
+
+        {/* Transfer Stock */}
+        {showTransfer && (
+          <div className="card" style={{border:'2px solid #0d9488'}}>
+            <div className="card-title">🔄 Transfer Stock Between Godowns</div>
+
+            {transferSuccess && <div style={{background:'#dcfce7',border:'1px solid #86efac',color:'#166534',borderRadius:8,padding:'10px 16px',marginBottom:14,fontWeight:600}}>{transferSuccess}</div>}
+            {transferError && <div className="alert-error">{transferError}</div>}
+
+            {/* Item search */}
+            <div style={{position:'relative',marginBottom:14}}>
+              <label className="field-label">Item to Transfer</label>
+              <input
+                className="input" style={{marginBottom:0}}
+                placeholder="Type item name to search..."
+                value={transferSearch}
+                onChange={e=>{ setTransferSearch(e.target.value); setTransferItem(null); }}
+              />
+              {transferSuggestions.length > 0 && (
+                <div style={{position:'absolute',zIndex:100,left:0,right:0,background:'white',border:'1px solid #cbd5e1',borderRadius:8,boxShadow:'0 8px 24px rgba(0,0,0,0.12)',marginTop:4,maxHeight:260,overflowY:'auto'}}>
+                  {transferSuggestions.map(item => (
+                    <div key={item.id}
+                      onClick={()=>pickTransferItem(item)}
+                      style={{padding:'10px 16px',cursor:'pointer',borderBottom:'1px solid #f1f5f9'}}
+                      onMouseEnter={e=>e.currentTarget.style.background='#f0f9ff'}
+                      onMouseLeave={e=>e.currentTarget.style.background='white'}
+                    >
+                      <div style={{fontWeight:600}}>{item.name}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {transferItem && (
+              <>
+                <div className="form-row-2">
+                  <div>
+                    <label className="field-label">From Godown</label>
+                    <select className="input" style={{marginBottom:0}} value={transferFromGodown} onChange={e=>{setTransferFromGodown(e.target.value); setTransferQty('');}}>
+                      {transferSourceGodowns.map(i => <option key={i.godown} value={i.godown}>{i.godown} ({i.quantity} {i.unit||'pcs'} avail.)</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="field-label">To Godown</label>
+                    <select className="input" style={{marginBottom:0}} value={transferToGodown} onChange={e=>setTransferToGodown(e.target.value)}>
+                      <option value="">Select Godown</option>
+                      {godowns.filter(g => g !== transferFromGodown).map(g => <option key={g}>{g}</option>)}
+                    </select>
+                  </div>
+                </div>
+                <div className="form-row-2">
+                  <div>
+                    <label className="field-label">Quantity (max {transferAvailableQty})</label>
+                    <input className="input" style={{marginBottom:0}} type="number" min="0.01" max={transferAvailableQty} step="any" placeholder="Qty to move" value={transferQty} onChange={e=>setTransferQty(e.target.value)} />
+                  </div>
+                  <div>
+                    <label className="field-label">Remarks (optional)</label>
+                    <input className="input" style={{marginBottom:0}} placeholder="e.g. Production need" value={transferRemarks} onChange={e=>setTransferRemarks(e.target.value)} />
+                  </div>
+                </div>
+                <button className="btn" style={{background:'#0d9488',color:'white',width:'100%',justifyContent:'center',padding:'11px',fontSize:'15px'}} onClick={submitTransfer}>
+                  🔄 Transfer Stock
+                </button>
+              </>
             )}
           </div>
         )}

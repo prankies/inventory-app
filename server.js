@@ -12,6 +12,30 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
+// Merge any rows that share the same item name + godown (case-insensitive)
+// into one, summing quantities. Needed once to clean up data created before
+// the upsert-on-add logic existed (e.g. separate Opening + Regular rows).
+const mergeDuplicateInventoryRows = async () => {
+  const { rows: groups } = await pool.query(`
+    SELECT LOWER(name) AS lname, godown, array_agg(id ORDER BY id) AS ids,
+           SUM(quantity) AS total_qty, SUM(secondary_quantity) AS total_sec_qty,
+           SUM(opening_quantity) AS total_opening_qty
+    FROM inventory
+    GROUP BY LOWER(name), godown
+    HAVING COUNT(*) > 1
+  `);
+  for (const g of groups) {
+    const keepId = g.ids[g.ids.length - 1]; // most recently added row keeps its metadata
+    const dropIds = g.ids.slice(0, -1);
+    await pool.query(
+      'UPDATE inventory SET quantity=$1, secondary_quantity=$2, opening_quantity=$3 WHERE id=$4',
+      [g.total_qty, g.total_sec_qty, g.total_opening_qty, keepId]
+    );
+    await pool.query('DELETE FROM inventory WHERE id = ANY($1)', [dropIds]);
+  }
+  if (groups.length) console.log(`Merged ${groups.length} duplicate item/godown group(s) in inventory`);
+};
+
 const initDB = async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -54,6 +78,17 @@ const initDB = async () => {
       last_issued TEXT,
       issued_by TEXT
     );
+    CREATE TABLE IF NOT EXISTS transfers (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      from_godown TEXT NOT NULL,
+      to_godown TEXT NOT NULL,
+      quantity REAL NOT NULL,
+      unit TEXT DEFAULT 'pcs',
+      remarks TEXT DEFAULT '',
+      transferred_by TEXT NOT NULL,
+      transfer_date TEXT NOT NULL
+    );
   `);
 
   // Add new columns to existing table if they don't exist
@@ -66,10 +101,19 @@ const initDB = async () => {
     "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS remarks TEXT DEFAULT ''",
     "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS stock_type TEXT DEFAULT 'regular'",
     "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS category TEXT DEFAULT ''",
+    "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS opening_quantity REAL DEFAULT 0",
   ];
   for (const sql of alterCols) {
     try { await pool.query(sql); } catch(e) { /* ignore */ }
   }
+
+  // One-time cleanup: merge any pre-existing duplicate rows for the same
+  // (name, godown) — e.g. Opening Stock and Regular Stock entered before
+  // the upsert logic existed — into a single row, then enforce uniqueness.
+  await mergeDuplicateInventoryRows();
+  try {
+    await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS inventory_name_godown_uniq ON inventory (LOWER(name), godown)');
+  } catch (e) { console.error('Could not create uniqueness index, duplicates may remain:', e.message); }
 
   const defaults = ['Godown-1','Godown-2','Godown-3','Godown-4','Godown-5'];
   for (const g of defaults) {
@@ -122,31 +166,127 @@ app.get('/api/inventory', auth, async (req, res) => {
   res.json(rows);
 });
 
-const INV_FIELDS = `name, quantity, unit, secondary_quantity, secondary_unit, godown, date_added, added_by, price, hsn, builty_number, transporter, remarks, stock_type, category`;
-const INV_VALS  = `$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15`;
+const INV_FIELDS = `name, quantity, unit, secondary_quantity, secondary_unit, godown, date_added, added_by, price, hsn, builty_number, transporter, remarks, stock_type, category, opening_quantity`;
+const INV_VALS  = `$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16`;
+
+// Add stock to an existing (name, godown) row if one exists, otherwise create it.
+// This is what makes Regular Stock additions accumulate on top of Opening Stock
+// instead of fragmenting into a separate row.
+async function upsertInventory(client, item, addedBy) {
+  const {
+    name, quantity, unit, secondary_quantity, secondary_unit, godown, dateAdded,
+    price, hsn, builty_number, transporter, remarks, stock_type, category
+  } = item;
+  const qty = parseFloat(quantity) || 0;
+  const secQty = parseFloat(secondary_quantity) || 0;
+
+  const { rows: existing } = await client.query(
+    'SELECT * FROM inventory WHERE LOWER(name)=LOWER($1) AND godown=$2 FOR UPDATE',
+    [name, godown]
+  );
+
+  if (existing.length) {
+    const row = existing[0];
+    const newQty = row.quantity + qty;
+    const newSecQty = (row.secondary_quantity || 0) + secQty;
+    const newOpeningQty = (row.opening_quantity || 0) + (stock_type === 'opening' ? qty : 0);
+    const { rows: updated } = await client.query(
+      `UPDATE inventory SET quantity=$1, secondary_quantity=$2,
+         secondary_unit=COALESCE(NULLIF($3,''), secondary_unit),
+         date_added=$4, added_by=$5, price=$6, hsn=$7, builty_number=$8,
+         transporter=$9, remarks=$10, category=COALESCE(NULLIF($11,''), category),
+         opening_quantity=$12
+       WHERE id=$13 RETURNING *`,
+      [newQty, newSecQty, secondary_unit || '', dateAdded, addedBy, price || 0,
+       hsn || 'N/A', builty_number || '', transporter || '', remarks || '',
+       category || '', newOpeningQty, row.id]
+    );
+    return updated[0];
+  }
+
+  const { rows: inserted } = await client.query(
+    `INSERT INTO inventory (${INV_FIELDS}) VALUES (${INV_VALS}) RETURNING *`,
+    [name, qty, unit || 'pcs', secQty, secondary_unit || '', godown,
+     dateAdded || new Date().toLocaleDateString(), addedBy,
+     price || 0, hsn || 'N/A', builty_number || '', transporter || '', remarks || '',
+     stock_type || 'regular', category || '', stock_type === 'opening' ? qty : 0]
+  );
+  return inserted[0];
+}
 
 app.post('/api/inventory', auth, async (req, res) => {
-  const { name, quantity, unit, secondary_quantity, secondary_unit, godown, dateAdded, price, hsn, builty_number, transporter, remarks, stock_type, category } = req.body;
-  const { rows } = await pool.query(
-    `INSERT INTO inventory (${INV_FIELDS}) VALUES (${INV_VALS}) RETURNING *`,
-    [name, quantity||0, unit||'pcs', secondary_quantity||0, secondary_unit||'', godown,
-     dateAdded||new Date().toLocaleDateString(), req.user.email,
-     price||0, hsn||'N/A', builty_number||'', transporter||'', remarks||'', stock_type||'regular', category||'']
-  );
-  res.json(rows[0]);
+  const row = await upsertInventory(pool, req.body, req.user.email);
+  res.json(row);
 });
 
 app.post('/api/inventory/bulk', auth, async (req, res) => {
   const { items } = req.body;
   for (const item of items) {
-    await pool.query(
-      `INSERT INTO inventory (${INV_FIELDS}) VALUES (${INV_VALS})`,
-      [item.name, item.quantity||0, item.unit||'pcs', item.secondary_quantity||0, item.secondary_unit||'',
-       item.godown, item.dateAdded||new Date().toLocaleDateString(), req.user.email,
-       item.price||0, item.hsn||'N/A', item.builty_number||'', item.transporter||'', item.remarks||'', item.stock_type||'regular', item.category||'']
-    );
+    await upsertInventory(pool, item, req.user.email);
   }
   res.json({ message: `Added ${items.length} items` });
+});
+
+// Transfer stock between godowns — atomic decrement at source, merge/credit at destination
+app.post('/api/inventory/transfer', auth, async (req, res) => {
+  const { name, fromGodown, toGodown, quantity, remarks, unit } = req.body;
+  const qty = parseFloat(quantity) || 0;
+  if (!name || !fromGodown || !toGodown || qty <= 0) {
+    return res.status(400).json({ error: 'Item, source/destination godown and a positive quantity are required' });
+  }
+  if (fromGodown === toGodown) {
+    return res.status(400).json({ error: 'Source and destination godown must be different' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: sourceRows } = await client.query(
+      'SELECT * FROM inventory WHERE LOWER(name)=LOWER($1) AND godown=$2 FOR UPDATE',
+      [name, fromGodown]
+    );
+    if (!sourceRows.length) throw Object.assign(new Error(`"${name}" not found in ${fromGodown}`), { status: 404 });
+    const source = sourceRows[0];
+    if (source.quantity < qty) throw Object.assign(new Error(`Only ${source.quantity} ${source.unit} available in ${fromGodown}`), { status: 400 });
+
+    const remainingQty = source.quantity - qty;
+    if (remainingQty === 0) {
+      await client.query('DELETE FROM inventory WHERE id=$1', [source.id]);
+    } else {
+      await client.query('UPDATE inventory SET quantity=$1 WHERE id=$2', [remainingQty, source.id]);
+    }
+
+    const dateNow = new Date().toLocaleDateString();
+    const destRow = await upsertInventory(client, {
+      name: source.name, quantity: qty, unit: unit || source.unit,
+      secondary_quantity: 0, secondary_unit: source.secondary_unit,
+      godown: toGodown, dateAdded: dateNow, price: source.price, hsn: source.hsn,
+      builty_number: source.builty_number, transporter: '',
+      remarks: remarks || `Transferred from ${fromGodown}`,
+      stock_type: 'regular', category: source.category
+    }, req.user.email);
+
+    await client.query(
+      `INSERT INTO transfers (name, from_godown, to_godown, quantity, unit, remarks, transferred_by, transfer_date)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [source.name, fromGodown, toGodown, qty, source.unit, remarks || '', req.user.email, dateNow]
+    );
+
+    await client.query('COMMIT');
+    res.json({ message: `Transferred ${qty} ${source.unit} of ${source.name} from ${fromGodown} to ${toGodown}`, destination: destRow });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(err.status || 500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Transfer history
+app.get('/api/transfers', auth, async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM transfers ORDER BY id DESC LIMIT 200');
+  res.json(rows);
 });
 
 app.put('/api/inventory/:id/issue', auth, async (req, res) => {
