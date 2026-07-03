@@ -63,6 +63,12 @@ const InventoryApp = () => {
   const [slipRemarks, setSlipRemarks] = useState('');
   const [issueSuccess, setIssueSuccess] = useState('');
 
+  // Stock Ledger
+  const [showLedger, setShowLedger] = useState(false);
+  const [ledgerRows, setLedgerRows] = useState([]);
+  const [ledgerFilter, setLedgerFilter] = useState({ name: '', godown: '', type: '', from_date: '', to_date: '' });
+  const [ledgerLoading, setLedgerLoading] = useState(false);
+
   // Transfer Stock
   const [showTransfer, setShowTransfer] = useState(false);
   const [transferSearch, setTransferSearch] = useState('');
@@ -105,6 +111,16 @@ const InventoryApp = () => {
     const data = await res.json();
     setCategories(Array.isArray(data) ? data : []);
   }, [token]);
+
+  const loadLedger = useCallback(async (filters) => {
+    setLedgerLoading(true);
+    const f = filters || ledgerFilter;
+    const params = new URLSearchParams(Object.fromEntries(Object.entries(f).filter(([,v]) => v)));
+    const res = await fetch(`${API}/ledger?${params}`, { headers: { Authorization: token } });
+    const data = await res.json();
+    setLedgerRows(Array.isArray(data) ? data : []);
+    setLedgerLoading(false);
+  }, [token, ledgerFilter]);
 
   const fetchSuggestions = async (q) => {
     if (!q || q.length < 1) { setItemSuggestions([]); return; }
@@ -466,6 +482,7 @@ const InventoryApp = () => {
           <button className="btn" style={{background:'#0d9488',color:'white'}} onClick={()=>setShowTransfer(!showTransfer)}>🔄 Transfer</button>
           <button className="btn btn-green" onClick={()=>setShowUpload(!showUpload)}>📤 Upload Bill</button>
           <button className="btn" style={{background:'#0891b2',color:'white'}} onClick={()=>setShowImport(!showImport)}>📊 Import CSV/XLS</button>
+          <button className="btn" style={{background:'#b45309',color:'white'}} onClick={()=>{ setShowLedger(!showLedger); if(!showLedger) loadLedger(); }}>📒 Ledger</button>
           <button className="btn btn-light" onClick={()=>setEditingGodowns(!editingGodowns)}>🏭 Godowns</button>
           <button className="btn btn-red" onClick={handleLogout}>🚪 Sign Out</button>
         </div>
@@ -664,6 +681,100 @@ const InventoryApp = () => {
                   🔄 Transfer Stock
                 </button>
               </>
+            )}
+          </div>
+        )}
+
+        {/* Stock Ledger */}
+        {showLedger && (
+          <div className="card" style={{border:'2px solid #b45309'}}>
+            <div className="card-title" style={{justifyContent:'space-between'}}>
+              <span>📒 Stock Ledger — IN / OUT Statement</span>
+              <button className="btn btn-green btn-sm" onClick={()=>{ const csv=[['Date','Item','Godown','Movement','Qty','Unit','Balance','Reference','Remarks','By'],...ledgerRows.map(r=>[r.action_date,r.name,r.godown,r.movement_type,r.quantity,r.unit,r.running_balance,r.reference,r.remarks,r.action_by])].map(r=>r.map(v=>`"${v||''}"`).join(',')).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download=`ledger_${new Date().toISOString().split('T')[0]}.csv`;a.click();}}>📥 Export CSV</button>
+            </div>
+
+            {/* Filters */}
+            <div className="form-row-5a" style={{marginBottom:14}}>
+              <div>
+                <label className="field-label">Item Name</label>
+                <input className="input" style={{marginBottom:0}} placeholder="Search item..." value={ledgerFilter.name}
+                  onChange={e=>setLedgerFilter(f=>({...f,name:e.target.value}))} />
+              </div>
+              <div>
+                <label className="field-label">Godown</label>
+                <select className="input" style={{marginBottom:0}} value={ledgerFilter.godown} onChange={e=>setLedgerFilter(f=>({...f,godown:e.target.value}))}>
+                  <option value="">All</option>
+                  {godowns.map(g=><option key={g}>{g}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="field-label">Movement</label>
+                <select className="input" style={{marginBottom:0}} value={ledgerFilter.type} onChange={e=>setLedgerFilter(f=>({...f,type:e.target.value}))}>
+                  <option value="">All</option>
+                  <option value="IN">IN (Regular)</option>
+                  <option value="OPENING">IN (Opening)</option>
+                  <option value="OUT">OUT (Issue)</option>
+                  <option value="TRANSFER-IN">Transfer IN</option>
+                  <option value="TRANSFER-OUT">Transfer OUT</option>
+                </select>
+              </div>
+              <div>
+                <label className="field-label">From Date</label>
+                <input type="date" className="input" style={{marginBottom:0}} value={ledgerFilter.from_date} onChange={e=>setLedgerFilter(f=>({...f,from_date:e.target.value}))} />
+              </div>
+              <div>
+                <label className="field-label">To Date</label>
+                <input type="date" className="input" style={{marginBottom:0}} value={ledgerFilter.to_date} onChange={e=>setLedgerFilter(f=>({...f,to_date:e.target.value}))} />
+              </div>
+            </div>
+            <button className="btn btn-blue" style={{marginBottom:14}} onClick={()=>loadLedger()}>🔍 Apply Filters</button>
+
+            {ledgerLoading ? (
+              <div style={{textAlign:'center',padding:24,color:'#64748b'}}>Loading...</div>
+            ) : ledgerRows.length === 0 ? (
+              <div style={{textAlign:'center',padding:24,color:'#94a3b8',background:'#f8fafc',borderRadius:8,border:'1.5px dashed #cbd5e1'}}>
+                No ledger entries yet. Stock movements (add / issue / transfer) will appear here automatically.
+              </div>
+            ) : (
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Date</th><th>Item</th><th>Godown</th><th>Movement</th>
+                      <th style={{textAlign:'right'}}>Qty</th><th>Unit</th>
+                      <th style={{textAlign:'right'}}>Balance</th>
+                      <th>Reference</th><th>Remarks</th><th>By</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ledgerRows.map(row => {
+                      const isIn = ['IN','OPENING','TRANSFER-IN'].includes(row.movement_type);
+                      const typeColors = {
+                        'IN':          {bg:'#dcfce7',color:'#166534'},
+                        'OPENING':     {bg:'#fef3c7',color:'#92400e'},
+                        'OUT':         {bg:'#fee2e2',color:'#991b1b'},
+                        'TRANSFER-IN': {bg:'#dbeafe',color:'#1e40af'},
+                        'TRANSFER-OUT':{bg:'#ede9fe',color:'#5b21b6'},
+                      };
+                      const tc = typeColors[row.movement_type] || {bg:'#f1f5f9',color:'#475569'};
+                      return (
+                        <tr key={row.id}>
+                          <td style={{color:'#94a3b8',fontSize:12,whiteSpace:'nowrap'}}>{row.action_date}</td>
+                          <td style={{fontWeight:600}}>{row.name}</td>
+                          <td style={{color:'#475569'}}>{row.godown}</td>
+                          <td><span style={{background:tc.bg,color:tc.color,padding:'2px 8px',borderRadius:20,fontSize:11,fontWeight:700,whiteSpace:'nowrap'}}>{row.movement_type}</span></td>
+                          <td style={{textAlign:'right',fontWeight:600,color: isIn ? '#16a34a' : '#dc2626'}}>{isIn ? '+' : '-'}{row.quantity}</td>
+                          <td style={{color:'#64748b',fontSize:12}}>{row.unit}</td>
+                          <td style={{textAlign:'right',fontWeight:700}}>{parseFloat(row.running_balance).toFixed(2)}</td>
+                          <td style={{color:'#64748b',fontSize:12}}>{row.reference || '-'}</td>
+                          <td style={{color:'#64748b',fontSize:12,maxWidth:120,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{row.remarks || '-'}</td>
+                          <td style={{color:'#94a3b8',fontSize:11}}>{row.action_by}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             )}
           </div>
         )}

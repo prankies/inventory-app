@@ -89,6 +89,19 @@ const initDB = async () => {
       transferred_by TEXT NOT NULL,
       transfer_date TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS stock_ledger (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      godown TEXT NOT NULL,
+      movement_type TEXT NOT NULL,
+      quantity REAL NOT NULL,
+      unit TEXT DEFAULT 'pcs',
+      reference TEXT DEFAULT '',
+      remarks TEXT DEFAULT '',
+      action_by TEXT NOT NULL,
+      action_date TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
 
   // Add new columns to existing table if they don't exist
@@ -108,8 +121,8 @@ const initDB = async () => {
   }
 
   // One-time cleanup: merge any pre-existing duplicate rows for the same
-  // (name, godown) — e.g. Opening Stock and Regular Stock entered before
-  // the upsert logic existed — into a single row, then enforce uniqueness.
+  // (name, godown) -- e.g. Opening Stock and Regular Stock entered before
+  // the upsert logic existed -- into a single row, then enforce uniqueness.
   await mergeDuplicateInventoryRows();
   try {
     await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS inventory_name_godown_uniq ON inventory (LOWER(name), godown)');
@@ -169,6 +182,13 @@ app.get('/api/inventory', auth, async (req, res) => {
 const INV_FIELDS = `name, quantity, unit, secondary_quantity, secondary_unit, godown, date_added, added_by, price, hsn, builty_number, transporter, remarks, stock_type, category, opening_quantity`;
 const INV_VALS  = `$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16`;
 
+const logLedger = (client, { name, godown, movement_type, quantity, unit, reference, remarks, action_by, action_date }) =>
+  client.query(
+    `INSERT INTO stock_ledger (name, godown, movement_type, quantity, unit, reference, remarks, action_by, action_date)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [name, godown, movement_type, quantity, unit || 'pcs', reference || '', remarks || '', action_by, action_date || new Date().toLocaleDateString()]
+  );
+
 // Add stock to an existing (name, godown) row if one exists, otherwise create it.
 // This is what makes Regular Stock additions accumulate on top of Opening Stock
 // instead of fragmenting into a separate row.
@@ -184,6 +204,9 @@ async function upsertInventory(client, item, addedBy) {
     'SELECT * FROM inventory WHERE LOWER(name)=LOWER($1) AND godown=$2 FOR UPDATE',
     [name, godown]
   );
+
+  const movementType = stock_type === 'opening' ? 'OPENING' : 'IN';
+  const ref = builty_number || transporter || '';
 
   if (existing.length) {
     const row = existing[0];
@@ -201,6 +224,7 @@ async function upsertInventory(client, item, addedBy) {
        hsn || 'N/A', builty_number || '', transporter || '', remarks || '',
        category || '', newOpeningQty, row.id]
     );
+    await logLedger(client, { name: row.name, godown, movement_type: movementType, quantity: qty, unit: row.unit, reference: ref, remarks, action_by: addedBy, action_date: dateAdded });
     return updated[0];
   }
 
@@ -211,6 +235,7 @@ async function upsertInventory(client, item, addedBy) {
      price || 0, hsn || 'N/A', builty_number || '', transporter || '', remarks || '',
      stock_type || 'regular', category || '', stock_type === 'opening' ? qty : 0]
   );
+  await logLedger(client, { name: inserted[0].name, godown, movement_type: movementType, quantity: qty, unit: inserted[0].unit, reference: ref, remarks, action_by: addedBy, action_date: dateAdded });
   return inserted[0];
 }
 
@@ -227,7 +252,7 @@ app.post('/api/inventory/bulk', auth, async (req, res) => {
   res.json({ message: `Added ${items.length} items` });
 });
 
-// Transfer stock between godowns — atomic decrement at source, merge/credit at destination
+// Transfer stock between godowns -- atomic decrement at source, merge/credit at destination
 app.post('/api/inventory/transfer', auth, async (req, res) => {
   const { name, fromGodown, toGodown, quantity, remarks, unit } = req.body;
   const qty = parseFloat(quantity) || 0;
@@ -272,6 +297,8 @@ app.post('/api/inventory/transfer', auth, async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [source.name, fromGodown, toGodown, qty, source.unit, remarks || '', req.user.email, dateNow]
     );
+    await logLedger(client, { name: source.name, godown: fromGodown, movement_type: 'TRANSFER-OUT', quantity: qty, unit: source.unit, reference: toGodown, remarks: remarks || '', action_by: req.user.email, action_date: dateNow });
+    await logLedger(client, { name: source.name, godown: toGodown, movement_type: 'TRANSFER-IN', quantity: qty, unit: source.unit, reference: fromGodown, remarks: remarks || '', action_by: req.user.email, action_date: dateNow });
 
     await client.query('COMMIT');
     res.json({ message: `Transferred ${qty} ${source.unit} of ${source.name} from ${fromGodown} to ${toGodown}`, destination: destRow });
@@ -289,19 +316,47 @@ app.get('/api/transfers', auth, async (req, res) => {
   res.json(rows);
 });
 
+// Stock Ledger -- filterable IN/OUT log with running balance per item+godown
+app.get('/api/ledger', auth, async (req, res) => {
+  const { name, godown, type, from_date, to_date } = req.query;
+  const conditions = [];
+  const params = [];
+  if (name)      { params.push(`%${name.toLowerCase()}%`); conditions.push(`LOWER(sl.name) LIKE $${params.length}`); }
+  if (godown)    { params.push(godown);                    conditions.push(`sl.godown = $${params.length}`); }
+  if (type)      { params.push(type);                      conditions.push(`sl.movement_type = $${params.length}`); }
+  if (from_date) { params.push(from_date);                 conditions.push(`sl.created_at::date >= $${params.length}::date`); }
+  if (to_date)   { params.push(to_date);                   conditions.push(`sl.created_at::date <= $${params.length}::date`); }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const { rows } = await pool.query(
+    `SELECT sl.*,
+       SUM(CASE WHEN sl.movement_type IN ('IN','OPENING','TRANSFER-IN') THEN sl.quantity
+                ELSE -sl.quantity END)
+       OVER (PARTITION BY LOWER(sl.name), sl.godown ORDER BY sl.id) AS running_balance
+     FROM stock_ledger sl
+     ${where}
+     ORDER BY sl.id DESC
+     LIMIT 500`,
+    params
+  );
+  res.json(rows);
+});
+
 app.put('/api/inventory/:id/issue', auth, async (req, res) => {
   const { quantity, issued_to, remarks } = req.body;
   const { rows } = await pool.query('SELECT * FROM inventory WHERE id = $1', [req.params.id]);
   if (!rows.length) return res.status(404).json({ error: 'Item not found' });
-  const newQty = rows[0].quantity - quantity;
+  const item = rows[0];
+  const newQty = item.quantity - quantity;
   if (newQty < 0) return res.status(400).json({ error: 'Cannot issue more than available' });
+  const dateNow = new Date().toLocaleDateString();
+  await logLedger(pool, { name: item.name, godown: item.godown, movement_type: 'OUT', quantity, unit: item.unit, reference: issued_to || '', remarks: remarks || '', action_by: req.user.email, action_date: dateNow });
   if (newQty === 0) {
-    await pool.query('DELETE FROM inventory WHERE id = $1', [req.params.id]);
+    await pool.query('DELETE FROM inventory WHERE id = $1', [item.id]);
     return res.json({ deleted: true });
   }
   const { rows: updated } = await pool.query(
     'UPDATE inventory SET quantity=$1, last_issued=$2, issued_by=$3 WHERE id=$4 RETURNING *',
-    [newQty, new Date().toLocaleDateString(), issued_to ? `${req.user.email} â†’ ${issued_to}` : req.user.email, req.params.id]
+    [newQty, dateNow, issued_to ? `${req.user.email} -> ${issued_to}` : req.user.email, item.id]
   );
   res.json(updated[0]);
 });
@@ -311,7 +366,7 @@ app.delete('/api/inventory/:id', auth, async (req, res) => {
   res.json({ message: 'Deleted' });
 });
 
-// Item name suggestions (autocomplete) â€” searches master list + existing inventory
+// Item name suggestions (autocomplete) â€" searches master list + existing inventory
 app.get('/api/suggestions', auth, async (req, res) => {
   const q = (req.query.q || '').toLowerCase();
   const { rows } = await pool.query(
