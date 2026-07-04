@@ -444,6 +444,61 @@ const InventoryApp = () => {
     a.click();
   };
 
+  const printStock = () => {
+    const isGodownView = viewMode === 'by-godown';
+    const rows = isGodownView ? inventory.filter(i => i.godown === selectedGodown) : inventory;
+    const sorted = [...rows].sort((a, b) => a.godown.localeCompare(b.godown) || a.name.localeCompare(b.name));
+    const title = isGodownView ? `Stock Report — ${selectedGodown}` : 'Stock Report — All Godowns';
+    const totalQty = sorted.reduce((s, i) => s + i.quantity, 0);
+    const html = `<!DOCTYPE html><html><head><title>${title}</title><style>
+      body { font-family: Arial, sans-serif; margin: 24px; color: #111; }
+      .rpt-head { text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; margin-bottom: 16px; }
+      .rpt-head h1 { margin: 0; font-size: 20px; }
+      .rpt-head h2 { margin: 4px 0 0; font-size: 15px; font-weight: normal; }
+      .rpt-meta { display: flex; justify-content: space-between; font-size: 12px; color: #444; margin-bottom: 12px; }
+      table { width: 100%; border-collapse: collapse; font-size: 12px; }
+      th, td { border: 1px solid #999; padding: 6px 8px; text-align: left; }
+      th { background: #eee; }
+      td.num, th.num { text-align: right; }
+      tfoot td { font-weight: bold; background: #f5f5f5; }
+      .sign { margin-top: 48px; display: flex; justify-content: space-between; font-size: 12px; }
+      .sign div { border-top: 1px solid #333; padding-top: 4px; width: 180px; text-align: center; }
+      @media print { body { margin: 10mm; } }
+    </style></head><body>
+      <div class="rpt-head">
+        <h1>Goyal Printing &amp; Converting Industries</h1>
+        <h2>${title}</h2>
+      </div>
+      <div class="rpt-meta">
+        <span>Date: ${new Date().toLocaleDateString()} &nbsp; Time: ${new Date().toLocaleTimeString()}</span>
+        <span>Printed by: ${currentUser}</span>
+      </div>
+      <table>
+        <thead><tr>
+          <th>#</th><th>Item</th><th>Category</th>${isGodownView ? '' : '<th>Godown</th>'}
+          <th class="num">Qty</th><th>Unit</th><th class="num">Sec. Qty</th><th>Sec. Unit</th><th>Remarks</th>
+        </tr></thead>
+        <tbody>
+          ${sorted.map((i, idx) => `<tr>
+            <td>${idx + 1}</td><td>${i.name}</td><td>${i.category || '-'}</td>${isGodownView ? '' : `<td>${i.godown}</td>`}
+            <td class="num">${i.quantity}</td><td>${i.unit || 'pcs'}</td>
+            <td class="num">${i.secondary_quantity > 0 ? i.secondary_quantity : '-'}</td><td>${i.secondary_unit || '-'}</td>
+            <td>${i.remarks || '-'}</td>
+          </tr>`).join('')}
+        </tbody>
+        <tfoot><tr>
+          <td colspan="${isGodownView ? 3 : 4}">Total: ${sorted.length} items</td>
+          <td class="num">${totalQty}</td><td colspan="4"></td>
+        </tr></tfoot>
+      </table>
+      <div class="sign"><div>Prepared By</div><div>Checked By</div><div>Authorised Signatory</div></div>
+      <script>window.onload = () => { window.print(); }</script>
+    </body></html>`;
+    const w = window.open('', '_blank');
+    w.document.write(html);
+    w.document.close();
+  };
+
   const filtered = inventory.filter(i =>
     i.name.toLowerCase().includes(searchTerm.toLowerCase()) &&
     (filterCategory === '' || i.category === filterCategory)
@@ -1072,7 +1127,10 @@ const InventoryApp = () => {
               {viewMode==='by-godown'?`${selectedGodown} — Stock`:'All Stock'}
               <span style={{color:'#64748b',fontWeight:400,fontSize:14,marginLeft:8}}>({displayed.length} items)</span>
             </span>
-            <span style={{color:'#64748b',fontSize:13}}>{inventory.reduce((s,i)=>s+i.quantity,0)} total units</span>
+            <div style={{display:'flex',gap:8,alignItems:'center'}}>
+              <span style={{color:'#64748b',fontSize:13}}>{inventory.reduce((s,i)=>s+i.quantity,0)} total units</span>
+              <button className="btn btn-light btn-sm" onClick={printStock}>🖨 Print</button>
+            </div>
           </div>
           <div className="table-wrap">
             <table>
