@@ -36,6 +36,33 @@ const mergeDuplicateInventoryRows = async () => {
   if (groups.length) console.log(`Merged ${groups.length} duplicate item/godown group(s) in inventory`);
 };
 
+// Seed an opening-balance ledger entry for every current stock item that has
+// no seed yet, so items that existed BEFORE the ledger feature show their real
+// balance. Opening = current qty minus whatever the ledger already accounts for,
+// so seeding is safe even if some movements were already logged.
+const seedLedgerFromInventory = async () => {
+  const { rows: inv } = await pool.query('SELECT name, godown, quantity, unit FROM inventory');
+  let seeded = 0;
+  for (const it of inv) {
+    const { rows: [agg] } = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE reference = 'SYSTEM-SEED') AS seed_count,
+         COALESCE(SUM(CASE WHEN movement_type IN ('IN','OPENING','TRANSFER-IN') THEN quantity ELSE -quantity END), 0) AS net
+       FROM stock_ledger WHERE LOWER(name)=LOWER($1) AND godown=$2`,
+      [it.name, it.godown]
+    );
+    if (parseInt(agg.seed_count) > 0) continue;           // already seeded, skip
+    const opening = it.quantity - parseFloat(agg.net);    // base so opening + logged movements = current
+    await pool.query(
+      `INSERT INTO stock_ledger (name, godown, movement_type, quantity, unit, reference, remarks, action_by, action_date, created_at)
+       VALUES ($1,$2,'OPENING',$3,$4,'SYSTEM-SEED','Opening balance', 'system', $5, TIMESTAMPTZ '2000-01-01')`,
+      [it.name, it.godown, opening, it.unit || 'pcs', new Date().toLocaleDateString()]
+    );
+    seeded++;
+  }
+  if (seeded) console.log(`Seeded ${seeded} opening-balance ledger entries`);
+};
+
 const initDB = async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -102,6 +129,23 @@ const initDB = async () => {
       action_date TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS issue_slips (
+      id SERIAL PRIMARY KEY,
+      issued_to TEXT DEFAULT '',
+      remarks TEXT DEFAULT '',
+      issued_by TEXT NOT NULL,
+      issue_date TEXT NOT NULL,
+      status TEXT DEFAULT 'active',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS issue_slip_items (
+      id SERIAL PRIMARY KEY,
+      slip_id INTEGER NOT NULL REFERENCES issue_slips(id),
+      name TEXT NOT NULL,
+      godown TEXT NOT NULL,
+      quantity REAL NOT NULL,
+      unit TEXT DEFAULT 'pcs'
+    );
   `);
 
   // Add new columns to existing table if they don't exist
@@ -132,7 +176,11 @@ const initDB = async () => {
   for (const g of defaults) {
     await pool.query('INSERT INTO godowns (name) VALUES ($1) ON CONFLICT DO NOTHING', [g]);
   }
-  console.log('Database ready - v2.1');
+
+  // Backfill opening balances into the ledger for pre-existing stock
+  try { await seedLedgerFromInventory(); } catch (e) { console.error('Ledger seed failed:', e.message); }
+
+  console.log('Database ready - v2.2');
 };
 
 app.use(cors());
@@ -316,6 +364,109 @@ app.get('/api/transfers', auth, async (req, res) => {
   res.json(rows);
 });
 
+// Create an issue slip: deduct all items atomically and store the slip record
+app.post('/api/issue-slips', auth, async (req, res) => {
+  const { items, issued_to, remarks } = req.body;
+  if (!items || !items.length) return res.status(400).json({ error: 'No items on the slip' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const dateNow = new Date().toLocaleDateString();
+
+    // Validate all availabilities first
+    for (const it of items) {
+      const { rows } = await client.query(
+        'SELECT * FROM inventory WHERE id=$1 FOR UPDATE', [it.id]);
+      if (!rows.length) throw Object.assign(new Error(`${it.name}: item not found`), { status: 404 });
+      if (rows[0].quantity < it.quantity) throw Object.assign(new Error(`${it.name}: only ${rows[0].quantity} available`), { status: 400 });
+    }
+
+    const { rows: slipRows } = await client.query(
+      `INSERT INTO issue_slips (issued_to, remarks, issued_by, issue_date) VALUES ($1,$2,$3,$4) RETURNING *`,
+      [issued_to || '', remarks || '', req.user.email, dateNow]
+    );
+    const slip = slipRows[0];
+
+    for (const it of items) {
+      const { rows } = await client.query('SELECT * FROM inventory WHERE id=$1', [it.id]);
+      const inv = rows[0];
+      const newQty = inv.quantity - it.quantity;
+      if (newQty === 0) {
+        await client.query('DELETE FROM inventory WHERE id=$1', [inv.id]);
+      } else {
+        await client.query(
+          'UPDATE inventory SET quantity=$1, last_issued=$2, issued_by=$3 WHERE id=$4',
+          [newQty, dateNow, issued_to ? `${req.user.email} -> ${issued_to}` : req.user.email, inv.id]
+        );
+      }
+      await client.query(
+        `INSERT INTO issue_slip_items (slip_id, name, godown, quantity, unit) VALUES ($1,$2,$3,$4,$5)`,
+        [slip.id, inv.name, inv.godown, it.quantity, inv.unit || 'pcs']
+      );
+      await logLedger(client, { name: inv.name, godown: inv.godown, movement_type: 'OUT', quantity: it.quantity, unit: inv.unit, reference: `Slip #${slip.id}${issued_to ? ' / ' + issued_to : ''}`, remarks: remarks || '', action_by: req.user.email, action_date: dateNow });
+    }
+
+    await client.query('COMMIT');
+    res.json({ message: `Slip #${slip.id} issued (${items.length} items)`, slip_id: slip.id });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(err.status || 500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Recent issue slips with their items
+app.get('/api/issue-slips', auth, async (req, res) => {
+  const { rows: slips } = await pool.query(`SELECT * FROM issue_slips ORDER BY id DESC LIMIT 50`);
+  const ids = slips.map(s => s.id);
+  const { rows: items } = ids.length
+    ? await pool.query('SELECT * FROM issue_slip_items WHERE slip_id = ANY($1)', [ids])
+    : { rows: [] };
+  res.json(slips.map(s => ({ ...s, items: items.filter(i => i.slip_id === s.id) })));
+});
+
+// Delete (undo) an issue slip: restore quantities to their godowns
+app.delete('/api/issue-slips/:id', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: slips } = await client.query('SELECT * FROM issue_slips WHERE id=$1 FOR UPDATE', [req.params.id]);
+    if (!slips.length) throw Object.assign(new Error('Slip not found'), { status: 404 });
+    if (slips[0].status === 'cancelled') throw Object.assign(new Error('Slip already cancelled'), { status: 400 });
+
+    const { rows: items } = await client.query('SELECT * FROM issue_slip_items WHERE slip_id=$1', [req.params.id]);
+    const dateNow = new Date().toLocaleDateString();
+
+    for (const it of items) {
+      // Restore quantity: merge back into existing row or recreate it
+      const { rows: existing } = await client.query(
+        'SELECT * FROM inventory WHERE LOWER(name)=LOWER($1) AND godown=$2 FOR UPDATE',
+        [it.name, it.godown]
+      );
+      if (existing.length) {
+        await client.query('UPDATE inventory SET quantity=quantity+$1 WHERE id=$2', [it.quantity, existing[0].id]);
+      } else {
+        await client.query(
+          `INSERT INTO inventory (${INV_FIELDS}) VALUES (${INV_VALS})`,
+          [it.name, it.quantity, it.unit || 'pcs', 0, '', it.godown, dateNow, req.user.email,
+           0, 'N/A', '', '', `Restored from cancelled slip #${req.params.id}`, 'regular', '', 0]
+        );
+      }
+      await logLedger(client, { name: it.name, godown: it.godown, movement_type: 'IN', quantity: it.quantity, unit: it.unit, reference: `Cancelled slip #${req.params.id}`, remarks: 'Issue slip reversed', action_by: req.user.email, action_date: dateNow });
+    }
+
+    await client.query("UPDATE issue_slips SET status='cancelled' WHERE id=$1", [req.params.id]);
+    await client.query('COMMIT');
+    res.json({ message: `Slip #${req.params.id} cancelled — ${items.length} item(s) restored to stock` });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(err.status || 500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // Stock Ledger -- filterable IN/OUT log with running balance per item+godown
 app.get('/api/ledger', auth, async (req, res) => {
   const { name, godown, type, from_date, to_date } = req.query;
@@ -331,10 +482,10 @@ app.get('/api/ledger', auth, async (req, res) => {
     `SELECT sl.*,
        SUM(CASE WHEN sl.movement_type IN ('IN','OPENING','TRANSFER-IN') THEN sl.quantity
                 ELSE -sl.quantity END)
-       OVER (PARTITION BY LOWER(sl.name), sl.godown ORDER BY sl.id) AS running_balance
+       OVER (PARTITION BY LOWER(sl.name), sl.godown ORDER BY sl.created_at, sl.id) AS running_balance
      FROM stock_ledger sl
      ${where}
-     ORDER BY sl.id DESC
+     ORDER BY sl.created_at DESC, sl.id DESC
      LIMIT 500`,
     params
   );

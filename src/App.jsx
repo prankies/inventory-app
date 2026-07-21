@@ -62,6 +62,8 @@ const InventoryApp = () => {
   const [slipIssuedTo, setSlipIssuedTo] = useState('');
   const [slipRemarks, setSlipRemarks] = useState('');
   const [issueSuccess, setIssueSuccess] = useState('');
+  const [recentSlips, setRecentSlips] = useState([]);
+  const [showRecentSlips, setShowRecentSlips] = useState(false);
 
   // Stock Ledger
   const [showLedger, setShowLedger] = useState(false);
@@ -258,19 +260,35 @@ const InventoryApp = () => {
     const invalid = slipItems.filter(s => !s.issueQty || parseFloat(s.issueQty) <= 0 || parseFloat(s.issueQty) > s.available);
     if (invalid.length) { alert(`Check quantities — ${invalid.length} item(s) have invalid or excess quantities.`); return; }
     if (!slipItems.length) { alert('Add at least one item to the slip.'); return; }
-    let errors = [];
-    for (const s of slipItems) {
-      const res = await fetch(`${API}/inventory/${s.id}/issue`, { method:'PUT', headers: authHeaders(), body: JSON.stringify({ quantity: parseFloat(s.issueQty), remarks: slipRemarks, issued_to: slipIssuedTo }) });
-      const data = await res.json();
-      if (!res.ok) errors.push(`${s.name}: ${data.error}`);
-    }
-    await loadInventory();
-    if (errors.length) { alert('Some items failed:\n' + errors.join('\n')); }
-    else {
-      setIssueSuccess(`✅ Issued ${slipItems.length} item(s) successfully!`);
-      setTimeout(() => setIssueSuccess(''), 4000);
-      setSlipItems([]); setSlipIssuedTo(''); setSlipRemarks('');
-    }
+    const res = await fetch(`${API}/issue-slips`, {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({
+        items: slipItems.map(s => ({ id: s.id, name: s.name, quantity: parseFloat(s.issueQty) })),
+        issued_to: slipIssuedTo, remarks: slipRemarks
+      })
+    });
+    const data = await res.json();
+    if (!res.ok) { alert(data.error); return; }
+    await loadInventory(); await loadRecentSlips();
+    setIssueSuccess(`✅ ${data.message}`);
+    setTimeout(() => setIssueSuccess(''), 4000);
+    setSlipItems([]); setSlipIssuedTo(''); setSlipRemarks('');
+  };
+
+  const loadRecentSlips = useCallback(async () => {
+    const res = await fetch(`${API}/issue-slips`, { headers: { Authorization: token } });
+    const data = await res.json();
+    setRecentSlips(Array.isArray(data) ? data : []);
+  }, [token]);
+
+  const cancelSlip = async (id) => {
+    if (!window.confirm(`Cancel Slip #${id}? All its quantities will be added back to stock.`)) return;
+    const res = await fetch(`${API}/issue-slips/${id}`, { method: 'DELETE', headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) { alert(data.error); return; }
+    await loadInventory(); await loadRecentSlips();
+    setIssueSuccess(`✅ ${data.message}`);
+    setTimeout(() => setIssueSuccess(''), 4000);
   };
 
   // Transfer Stock helpers
@@ -669,6 +687,39 @@ const InventoryApp = () => {
                 Search for items above to add them to this issue slip
               </div>
             )}
+
+            {/* Recent slips — view & cancel */}
+            <div style={{marginTop:16,borderTop:'1px solid #f1f5f9',paddingTop:12}}>
+              <button className="btn btn-light btn-sm" onClick={async()=>{ if(!showRecentSlips) await loadRecentSlips(); setShowRecentSlips(!showRecentSlips); }}>
+                {showRecentSlips ? '▲ Hide Recent Slips' : '▼ Show Recent Slips (view / cancel)'}
+              </button>
+              {showRecentSlips && (
+                recentSlips.length === 0 ? (
+                  <div style={{padding:'14px',color:'#94a3b8',fontSize:13}}>No slips yet.</div>
+                ) : (
+                  <div style={{display:'flex',flexDirection:'column',gap:8,marginTop:10}}>
+                    {recentSlips.map(slip => (
+                      <div key={slip.id} style={{background: slip.status==='cancelled' ? '#fef2f2' : '#f8fafc',border:'1px solid #e2e8f0',borderRadius:8,padding:'10px 14px'}}>
+                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:6}}>
+                          <div>
+                            <span style={{fontWeight:700}}>Slip #{slip.id}</span>
+                            <span style={{color:'#64748b',fontSize:12,marginLeft:8}}>{slip.issue_date} · by {slip.issued_by}{slip.issued_to ? ` → ${slip.issued_to}` : ''}</span>
+                            {slip.status==='cancelled' && <span style={{background:'#fee2e2',color:'#991b1b',padding:'2px 8px',borderRadius:20,fontSize:11,fontWeight:700,marginLeft:8}}>CANCELLED</span>}
+                          </div>
+                          {slip.status!=='cancelled' && (
+                            <button className="btn btn-red btn-sm" onClick={()=>cancelSlip(slip.id)}>↩ Cancel & Restore</button>
+                          )}
+                        </div>
+                        <div style={{fontSize:12,color:'#475569',marginTop:6}}>
+                          {slip.items.map(it => `${it.name} (${it.quantity} ${it.unit}, ${it.godown})`).join(' · ')}
+                        </div>
+                        {slip.remarks && <div style={{fontSize:12,color:'#94a3b8',marginTop:2}}>Remarks: {slip.remarks}</div>}
+                      </div>
+                    ))}
+                  </div>
+                )
+              )}
+            </div>
           </div>
         )}
 
@@ -753,7 +804,11 @@ const InventoryApp = () => {
               <div>
                 <label className="field-label">Item Name</label>
                 <input className="input" style={{marginBottom:0}} placeholder="Search item..." value={ledgerFilter.name}
+                  list="ledger-item-list" autoComplete="off"
                   onChange={e=>setLedgerFilter(f=>({...f,name:e.target.value}))} />
+                <datalist id="ledger-item-list">
+                  {[...new Set(inventory.map(i=>i.name))].sort().map(n=><option key={n} value={n}/>)}
+                </datalist>
               </div>
               <div>
                 <label className="field-label">Godown</label>
@@ -1104,7 +1159,10 @@ const InventoryApp = () => {
             )}
             <div className="search-wrap">
               <span className="search-icon">🔍</span>
-              <input className="input" style={{marginBottom:0}} placeholder="Search items..." value={searchTerm} onChange={e=>setSearchTerm(e.target.value)} />
+              <input className="input" style={{marginBottom:0}} placeholder="Search items..." value={searchTerm} onChange={e=>setSearchTerm(e.target.value)} list="inv-search-list" autoComplete="off" />
+              <datalist id="inv-search-list">
+                {[...new Set(inventory.map(i=>i.name))].sort().map(n=><option key={n} value={n}/>)}
+              </datalist>
             </div>
           </div>
         </div>
