@@ -492,6 +492,22 @@ app.get('/api/ledger', auth, async (req, res) => {
   res.json(rows);
 });
 
+// Daily stock received -- IN movements for a given day (IST), for the day-end summary
+app.get('/api/daily-receipts', auth, async (req, res) => {
+  const date = req.query.date; // YYYY-MM-DD in IST; defaults to today
+  const { rows } = await pool.query(
+    `SELECT name, godown, quantity, unit, reference, remarks, action_by, created_at
+     FROM stock_ledger
+     WHERE movement_type = 'IN'
+       AND reference <> 'SYSTEM-SEED'
+       AND (created_at AT TIME ZONE 'Asia/Kolkata')::date
+           = COALESCE($1::date, (NOW() AT TIME ZONE 'Asia/Kolkata')::date)
+     ORDER BY id DESC`,
+    [date || null]
+  );
+  res.json(rows);
+});
+
 app.put('/api/inventory/:id/issue', auth, async (req, res) => {
   const { quantity, issued_to, remarks } = req.body;
   const { rows } = await pool.query('SELECT * FROM inventory WHERE id = $1', [req.params.id]);

@@ -23,6 +23,7 @@ const InventoryApp = () => {
   const [newUnit, setNewUnit] = useState('pcs');
   const [newSecQty, setNewSecQty] = useState('');
   const [newSecUnit, setNewSecUnit] = useState('');
+  const [newConv, setNewConv] = useState('');   // secondary units per 1 primary unit
   const [newGodown, setNewGodown] = useState('');
   const [newBuilty, setNewBuilty] = useState('');
   const [newTransporter, setNewTransporter] = useState('');
@@ -64,6 +65,16 @@ const InventoryApp = () => {
   const [issueSuccess, setIssueSuccess] = useState('');
   const [recentSlips, setRecentSlips] = useState([]);
   const [showRecentSlips, setShowRecentSlips] = useState(false);
+
+  // Daily Receipts
+  const [showDaily, setShowDaily] = useState(false);
+  const [dailyReceipts, setDailyReceipts] = useState([]);
+  const [drItem, setDrItem] = useState('');
+  const [drQty, setDrQty] = useState('');
+  const [drUnit, setDrUnit] = useState('pcs');
+  const [drGodown, setDrGodown] = useState('');
+  const [drRemarks, setDrRemarks] = useState('');
+  const [drMsg, setDrMsg] = useState('');
 
   // Stock Ledger
   const [showLedger, setShowLedger] = useState(false);
@@ -130,6 +141,34 @@ const InventoryApp = () => {
     const data = await res.json();
     setItemSuggestions(Array.isArray(data) ? data : []);
     setShowSuggestions(true);
+  };
+
+  const istToday = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+  const loadDailyReceipts = useCallback(async () => {
+    const res = await fetch(`${API}/daily-receipts?date=${istToday()}`, { headers: { Authorization: token } });
+    const data = await res.json();
+    setDailyReceipts(Array.isArray(data) ? data : []);
+  }, [token]);
+
+  // Accordion: opening one tool panel closes the others so they don't stack
+  const togglePanel = (name) => {
+    const state = {
+      master: showMasterImport, issue: showIssueSlip, transfer: showTransfer,
+      upload: showUpload, import: showImport, ledger: showLedger,
+      godowns: editingGodowns, daily: showDaily,
+    };
+    const willOpen = !state[name];
+    setShowMasterImport(name === 'master' && willOpen);
+    setShowIssueSlip(name === 'issue' && willOpen);
+    setShowTransfer(name === 'transfer' && willOpen);
+    setShowUpload(name === 'upload' && willOpen);
+    setShowImport(name === 'import' && willOpen);
+    setShowLedger(name === 'ledger' && willOpen);
+    setEditingGodowns(name === 'godowns' && willOpen);
+    setShowDaily(name === 'daily' && willOpen);
+    if (willOpen && name === 'ledger') loadLedger();
+    if (willOpen && name === 'daily') loadDailyReceipts();
   };
 
   useEffect(() => {
@@ -230,7 +269,75 @@ const InventoryApp = () => {
       body: JSON.stringify({ name:newItem, quantity:parseFloat(newQty), unit:newUnit, secondary_quantity:parseFloat(newSecQty)||0, secondary_unit:newSecUnit, godown:newGodown, dateAdded:new Date().toLocaleDateString(), builty_number:newBuilty, transporter:newTransporter, remarks:newRemarks, stock_type:newStockType, category:newCategory })
     });
     await loadInventory(); await loadCategories();
-    setNewItem(''); setNewQty(''); setNewSecQty(''); setNewBuilty(''); setNewTransporter(''); setNewRemarks(''); setNewCategory('');
+    setNewItem(''); setNewQty(''); setNewSecQty(''); setNewConv(''); setNewBuilty(''); setNewTransporter(''); setNewRemarks(''); setNewCategory('');
+  };
+
+  // Recompute secondary qty from primary qty × conversion factor
+  const recalcSecondary = (primaryQty, conv) => {
+    const p = parseFloat(primaryQty), c = parseFloat(conv);
+    if (!isNaN(p) && !isNaN(c) && c > 0) setNewSecQty(String(+(p * c).toFixed(3)));
+  };
+
+  const addDailyReceipt = async (e) => {
+    e.preventDefault();
+    if (!drItem || !drQty || !drGodown) { setDrMsg('❌ Item, quantity and godown are required'); return; }
+    const res = await fetch(`${API}/inventory`, {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({ name: drItem, quantity: parseFloat(drQty), unit: drUnit, godown: drGodown, dateAdded: new Date().toLocaleDateString(), remarks: drRemarks, stock_type: 'regular' })
+    });
+    if (!res.ok) { const d = await res.json(); setDrMsg('❌ ' + (d.error || 'Failed')); return; }
+    await loadInventory(); await loadDailyReceipts();
+    setDrItem(''); setDrQty(''); setDrRemarks('');
+    setDrMsg('✅ Added to today’s receipts');
+    setTimeout(() => setDrMsg(''), 2500);
+  };
+
+  const shareDailyWhatsApp = async () => {
+    const list = dailyReceipts;
+    if (!list.length) { alert('No stock received today to share.'); return; }
+    const dateStr = new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
+    const W = 760, pad = 28, rowH = 38, headH = 118;
+    const H = headH + 70 + list.length * rowH + 50;
+    const c = document.createElement('canvas'); c.width = W; c.height = H;
+    const x = c.getContext('2d');
+    x.fillStyle = '#ffffff'; x.fillRect(0, 0, W, H);
+    x.fillStyle = '#4338ca'; x.fillRect(0, 0, W, headH);
+    x.fillStyle = '#ffffff'; x.font = 'bold 26px Arial';
+    x.fillText('Daily Stock Received', pad, 46);
+    x.font = '16px Arial'; x.fillText('Goyal Printing & Converting Industries', pad, 74);
+    x.font = 'bold 15px Arial'; x.fillText(`${dateStr}  •  ${list.length} item(s)`, pad, 100);
+    let y = headH + 44;
+    x.fillStyle = '#64748b'; x.font = 'bold 13px Arial';
+    x.fillText('#  ITEM', pad, y); x.fillText('QTY', 440, y); x.fillText('KEPT AT', 560, y);
+    y += 12; x.strokeStyle = '#e2e8f0'; x.lineWidth = 1;
+    x.beginPath(); x.moveTo(pad, y); x.lineTo(W - pad, y); x.stroke();
+    y += 28;
+    list.forEach((r, i) => {
+      x.fillStyle = '#0f172a'; x.font = '15px Arial';
+      x.fillText(`${i + 1}. ${r.name}`.substring(0, 42), pad, y);
+      x.fillStyle = '#334155'; x.font = 'bold 15px Arial';
+      x.fillText(`${r.quantity} ${r.unit || ''}`, 440, y);
+      x.fillStyle = '#4338ca';
+      x.fillText(r.godown, 560, y);
+      x.strokeStyle = '#f1f5f9';
+      x.beginPath(); x.moveTo(pad, y + 12); x.lineTo(W - pad, y + 12); x.stroke();
+      y += rowH;
+    });
+    x.fillStyle = '#94a3b8'; x.font = '12px Arial';
+    x.fillText('Generated by Inventory Hub • stock.gpci.in', pad, H - 20);
+
+    const textSummary = `*Daily Stock Received — ${dateStr}*\n${list.map((r, i) => `${i + 1}. ${r.name} — ${r.quantity} ${r.unit || ''} — ${r.godown}`).join('\n')}`;
+    c.toBlob(async (blob) => {
+      const file = new File([blob], `daily-stock-${istToday()}.png`, { type: 'image/png' });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try { await navigator.share({ files: [file], text: textSummary }); }
+        catch (err) { /* user cancelled */ }
+      } else {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob); a.download = file.name; a.click();
+        window.open(`https://wa.me/?text=${encodeURIComponent(textSummary)}`, '_blank');
+      }
+    }, 'image/png');
   };
 
   const issueItem = async (id) => {
@@ -556,13 +663,14 @@ const InventoryApp = () => {
           </div>
         </div>
         <div className="header-btns">
-          <button className={`nav-btn ${showMasterImport?'active':''}`} onClick={()=>setShowMasterImport(!showMasterImport)}>📚 Item Master</button>
-          <button className={`nav-btn ${showIssueSlip?'active':''}`} onClick={()=>setShowIssueSlip(!showIssueSlip)}>📋 Issue Slip</button>
-          <button className={`nav-btn ${showTransfer?'active':''}`} onClick={()=>setShowTransfer(!showTransfer)}>🔄 Transfer</button>
-          <button className={`nav-btn ${showUpload?'active':''}`} onClick={()=>setShowUpload(!showUpload)}>📤 Upload Bill</button>
-          <button className={`nav-btn ${showImport?'active':''}`} onClick={()=>setShowImport(!showImport)}>📊 Import CSV/XLS</button>
-          <button className={`nav-btn ${showLedger?'active':''}`} onClick={()=>{ setShowLedger(!showLedger); if(!showLedger) loadLedger(); }}>📒 Ledger</button>
-          <button className={`nav-btn ${editingGodowns?'active':''}`} onClick={()=>setEditingGodowns(!editingGodowns)}>🏭 Godowns</button>
+          <button className={`nav-btn ${showDaily?'active':''}`} onClick={()=>togglePanel('daily')}>📅 Daily Receipts</button>
+          <button className={`nav-btn ${showMasterImport?'active':''}`} onClick={()=>togglePanel('master')}>📚 Item Master</button>
+          <button className={`nav-btn ${showIssueSlip?'active':''}`} onClick={()=>togglePanel('issue')}>📋 Issue Slip</button>
+          <button className={`nav-btn ${showTransfer?'active':''}`} onClick={()=>togglePanel('transfer')}>🔄 Transfer</button>
+          <button className={`nav-btn ${showUpload?'active':''}`} onClick={()=>togglePanel('upload')}>📤 Upload Bill</button>
+          <button className={`nav-btn ${showImport?'active':''}`} onClick={()=>togglePanel('import')}>📊 Import CSV/XLS</button>
+          <button className={`nav-btn ${showLedger?'active':''}`} onClick={()=>togglePanel('ledger')}>📒 Ledger</button>
+          <button className={`nav-btn ${editingGodowns?'active':''}`} onClick={()=>togglePanel('godowns')}>🏭 Godowns</button>
           <button className="nav-btn danger" onClick={handleLogout}>🚪 Sign Out</button>
         </div>
       </div>
@@ -588,6 +696,82 @@ const InventoryApp = () => {
             <div><div className="stat-num">{categories.length}</div><div className="stat-lbl">Categories</div></div>
           </div>
         </div>
+
+        {/* Daily Receipts */}
+        {showDaily && (
+          <div className="card" style={{border:'2px solid #4338ca'}}>
+            <div className="card-title" style={{justifyContent:'space-between'}}>
+              <span>📅 Daily Stock Received — {new Date().toLocaleDateString('en-GB',{timeZone:'Asia/Kolkata',day:'2-digit',month:'short',year:'numeric'})}</span>
+              <button className="btn btn-green btn-sm" onClick={shareDailyWhatsApp}>📲 Share to WhatsApp</button>
+            </div>
+
+            {drMsg && <div style={{padding:'9px 14px',borderRadius:8,marginBottom:12,fontWeight:600,fontSize:13,background: drMsg.startsWith('✅')?'#f0fdf4':'#fef2f2',color: drMsg.startsWith('✅')?'#166534':'#dc2626',border:`1px solid ${drMsg.startsWith('✅')?'#86efac':'#fecaca'}`}}>{drMsg}</div>}
+
+            {/* Quick entry form */}
+            <form onSubmit={addDailyReceipt} className="form-row-5a" style={{alignItems:'end'}}>
+              <div>
+                <label className="field-label">Item Received *</label>
+                <input className="input" style={{marginBottom:0}} placeholder="Item name" value={drItem}
+                  list="daily-item-list" autoComplete="off"
+                  onChange={e=>setDrItem(e.target.value)} required />
+                <datalist id="daily-item-list">
+                  {[...new Set(inventory.map(i=>i.name))].sort().map(n=><option key={n} value={n}/>)}
+                </datalist>
+              </div>
+              <div>
+                <label className="field-label">Qty *</label>
+                <input className="input" style={{marginBottom:0}} type="number" step="any" placeholder="Qty" value={drQty} onChange={e=>setDrQty(e.target.value)} required />
+              </div>
+              <div>
+                <label className="field-label">Unit</label>
+                <select className="input" style={{marginBottom:0}} value={drUnit} onChange={e=>setDrUnit(e.target.value)}>
+                  {UNITS.map(u=><option key={u}>{u}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="field-label">Kept At (Godown) *</label>
+                <select className="input" style={{marginBottom:0}} value={drGodown} onChange={e=>setDrGodown(e.target.value)} required>
+                  <option value="">Select</option>
+                  {godowns.map(g=><option key={g}>{g}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="field-label">Remarks</label>
+                <div style={{display:'flex',gap:8}}>
+                  <input className="input" style={{marginBottom:0,flex:1}} placeholder="Optional" value={drRemarks} onChange={e=>setDrRemarks(e.target.value)} />
+                  <button className="btn btn-blue" type="submit">➕</button>
+                </div>
+              </div>
+            </form>
+
+            {/* Today's received list */}
+            <div style={{marginTop:16}}>
+              {dailyReceipts.length === 0 ? (
+                <div style={{textAlign:'center',padding:'22px',color:'#94a3b8',background:'#f8fafc',borderRadius:10,border:'1.5px dashed #cbd5e1'}}>
+                  Nothing recorded yet today. Add items above as stock arrives, then share the summary on WhatsApp at day end.
+                </div>
+              ) : (
+                <div className="table-wrap">
+                  <table>
+                    <thead><tr><th>#</th><th>Item</th><th style={{textAlign:'right'}}>Qty</th><th>Unit</th><th>Kept At</th><th>Remarks</th></tr></thead>
+                    <tbody>
+                      {dailyReceipts.map((r,i)=>(
+                        <tr key={i}>
+                          <td style={{color:'#94a3b8'}}>{i+1}</td>
+                          <td style={{fontWeight:600,color:'#0f172a'}}>{r.name}</td>
+                          <td style={{textAlign:'right',fontWeight:700}}>{r.quantity}</td>
+                          <td>{r.unit}</td>
+                          <td><span style={{background:'#eef2ff',color:'#4338ca',padding:'2px 10px',borderRadius:20,fontSize:12,fontWeight:600}}>{r.godown}</span></td>
+                          <td style={{color:'#64748b',fontSize:12}}>{r.remarks||'-'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Master Item List Import */}
         {showMasterImport && (
@@ -1085,8 +1269,8 @@ const InventoryApp = () => {
                 <button type="button" className={`btn btn-sm ${newStockType==='opening'?'btn-blue':'btn-light'}`} onClick={()=>setNewStockType('opening')}>🗂 Opening Stock</button>
               </div>
 
-              {/* Row 1: Item, Qty, Unit, Sec Qty, Sec Unit */}
-              <div className='form-row-5a'>
+              {/* Row 1: Item, Qty, Unit, Conv, Sec Qty, Sec Unit */}
+              <div className='form-row-6a'>
                 <div style={{position:'relative'}}>
                   <label className="field-label">Item Name *</label>
                   <input className="input" style={{marginBottom:0}} placeholder="Item name" value={newItem}
@@ -1112,13 +1296,17 @@ const InventoryApp = () => {
                 </div>
                 <div>
                   <label className="field-label">Quantity *</label>
-                  <input className="input" style={{marginBottom:0}} type="number" placeholder="Qty" value={newQty} onChange={e=>setNewQty(e.target.value)} required />
+                  <input className="input" style={{marginBottom:0}} type="number" placeholder="Qty" value={newQty} onChange={e=>{ setNewQty(e.target.value); recalcSecondary(e.target.value, newConv); }} required />
                 </div>
                 <div>
                   <label className="field-label">Unit</label>
                   <select className="input" style={{marginBottom:0}} value={newUnit} onChange={e=>setNewUnit(e.target.value)}>
                     {UNITS.map(u=><option key={u}>{u}</option>)}
                   </select>
+                </div>
+                <div>
+                  <label className="field-label" title="Secondary units per 1 primary unit">Conv. (1 = ?)</label>
+                  <input className="input" style={{marginBottom:0}} type="number" step="any" placeholder="e.g. 20" value={newConv} onChange={e=>{ setNewConv(e.target.value); recalcSecondary(newQty, e.target.value); }} />
                 </div>
                 <div>
                   <label className="field-label">Sec. Qty</label>
