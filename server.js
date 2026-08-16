@@ -159,6 +159,8 @@ const initDB = async () => {
     "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS stock_type TEXT DEFAULT 'regular'",
     "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS category TEXT DEFAULT ''",
     "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS opening_quantity REAL DEFAULT 0",
+    "ALTER TABLE master_items ADD COLUMN IF NOT EXISTS secondary_unit TEXT DEFAULT ''",
+    "ALTER TABLE master_items ADD COLUMN IF NOT EXISTS conversion REAL DEFAULT 0",
   ];
   for (const sql of alterCols) {
     try { await pool.query(sql); } catch(e) { /* ignore */ }
@@ -289,6 +291,21 @@ async function upsertInventory(client, item, addedBy) {
 
 app.post('/api/inventory', auth, async (req, res) => {
   const row = await upsertInventory(pool, req.body, req.user.email);
+  // Remember this item's conversion + secondary unit in the master list so it
+  // doesn't have to be re-entered next time the item is added.
+  const conv = parseFloat(req.body.conversion);
+  if (req.body.name && conv > 0) {
+    try {
+      await pool.query(
+        `INSERT INTO master_items (name, unit, secondary_unit, conversion)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (name) DO UPDATE SET conversion=EXCLUDED.conversion,
+           secondary_unit=EXCLUDED.secondary_unit,
+           unit=COALESCE(NULLIF(EXCLUDED.unit,''), master_items.unit)`,
+        [req.body.name.trim(), req.body.unit || 'pcs', req.body.secondary_unit || '', conv]
+      );
+    } catch (e) { /* non-fatal */ }
+  }
   res.json(row);
 });
 
@@ -537,10 +554,10 @@ app.delete('/api/inventory/:id', auth, async (req, res) => {
 app.get('/api/suggestions', auth, async (req, res) => {
   const q = (req.query.q || '').toLowerCase();
   const { rows } = await pool.query(
-    `SELECT name, category, unit FROM (
-       SELECT name, category, unit, 1 AS priority FROM master_items WHERE LOWER(name) LIKE $1
+    `SELECT name, category, unit, conversion, secondary_unit FROM (
+       SELECT name, category, unit, conversion, secondary_unit, 1 AS priority FROM master_items WHERE LOWER(name) LIKE $1
        UNION
-       SELECT DISTINCT name, category, unit, 2 AS priority FROM inventory WHERE LOWER(name) LIKE $1
+       SELECT DISTINCT name, category, unit, 0 AS conversion, secondary_unit, 2 AS priority FROM inventory WHERE LOWER(name) LIKE $1
      ) combined
      ORDER BY priority, name LIMIT 12`,
     [`%${q}%`]
