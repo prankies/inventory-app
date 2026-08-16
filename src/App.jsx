@@ -537,7 +537,7 @@ const InventoryApp = () => {
             {isLogin ? '🔐 Sign In' : '✅ Create Account'}
           </button>
         </form>
-        <button onClick={()=>{setIsLogin(!isLogin);setAuthError('');}} style={{width:'100%',background:'none',border:'none',color:'#2563eb',cursor:'pointer',fontSize:'14px'}}>
+        <button onClick={()=>{setIsLogin(!isLogin);setAuthError('');}} style={{width:'100%',background:'none',border:'none',color:'#4f46e5',cursor:'pointer',fontSize:'14px',fontWeight:600}}>
           {isLogin ? "Don't have an account? Sign up" : 'Already have an account? Sign in'}
         </button>
       </div>
@@ -548,20 +548,46 @@ const InventoryApp = () => {
     <div>
       {/* Header */}
       <div className="header">
-        <div><h1>📦 Inventory Hub</h1><p>👤 {currentUser}</p></div>
+        <div className="brand">
+          <div className="brand-mark">📦</div>
+          <div>
+            <h1>Inventory Hub</h1>
+            <div className="sub">👤 {currentUser}</div>
+          </div>
+        </div>
         <div className="header-btns">
-          <button className="btn" style={{background:'#6d28d9',color:'white'}} onClick={()=>setShowMasterImport(!showMasterImport)}>📚 Item Master</button>
-          <button className="btn btn-orange" onClick={()=>setShowIssueSlip(!showIssueSlip)}>📋 Issue Slip</button>
-          <button className="btn" style={{background:'#0d9488',color:'white'}} onClick={()=>setShowTransfer(!showTransfer)}>🔄 Transfer</button>
-          <button className="btn btn-green" onClick={()=>setShowUpload(!showUpload)}>📤 Upload Bill</button>
-          <button className="btn" style={{background:'#0891b2',color:'white'}} onClick={()=>setShowImport(!showImport)}>📊 Import CSV/XLS</button>
-          <button className="btn" style={{background:'#b45309',color:'white'}} onClick={()=>{ setShowLedger(!showLedger); if(!showLedger) loadLedger(); }}>📒 Ledger</button>
-          <button className="btn btn-light" onClick={()=>setEditingGodowns(!editingGodowns)}>🏭 Godowns</button>
-          <button className="btn btn-red" onClick={handleLogout}>🚪 Sign Out</button>
+          <button className={`nav-btn ${showMasterImport?'active':''}`} onClick={()=>setShowMasterImport(!showMasterImport)}>📚 Item Master</button>
+          <button className={`nav-btn ${showIssueSlip?'active':''}`} onClick={()=>setShowIssueSlip(!showIssueSlip)}>📋 Issue Slip</button>
+          <button className={`nav-btn ${showTransfer?'active':''}`} onClick={()=>setShowTransfer(!showTransfer)}>🔄 Transfer</button>
+          <button className={`nav-btn ${showUpload?'active':''}`} onClick={()=>setShowUpload(!showUpload)}>📤 Upload Bill</button>
+          <button className={`nav-btn ${showImport?'active':''}`} onClick={()=>setShowImport(!showImport)}>📊 Import CSV/XLS</button>
+          <button className={`nav-btn ${showLedger?'active':''}`} onClick={()=>{ setShowLedger(!showLedger); if(!showLedger) loadLedger(); }}>📒 Ledger</button>
+          <button className={`nav-btn ${editingGodowns?'active':''}`} onClick={()=>setEditingGodowns(!editingGodowns)}>🏭 Godowns</button>
+          <button className="nav-btn danger" onClick={handleLogout}>🚪 Sign Out</button>
         </div>
       </div>
 
       <div className="main">
+
+        {/* KPI summary */}
+        <div className="stat-row">
+          <div className="stat">
+            <div className="stat-ic i-indigo">📦</div>
+            <div><div className="stat-num">{inventory.length}</div><div className="stat-lbl">Stock Items</div></div>
+          </div>
+          <div className="stat">
+            <div className="stat-ic i-green">🔢</div>
+            <div><div className="stat-num">{inventory.reduce((s,i)=>s+i.quantity,0).toLocaleString()}</div><div className="stat-lbl">Total Units</div></div>
+          </div>
+          <div className="stat">
+            <div className="stat-ic i-amber">🏭</div>
+            <div><div className="stat-num">{godowns.length}</div><div className="stat-lbl">Godowns</div></div>
+          </div>
+          <div className="stat">
+            <div className="stat-ic i-red">🏷️</div>
+            <div><div className="stat-num">{categories.length}</div><div className="stat-lbl">Categories</div></div>
+          </div>
+        </div>
 
         {/* Master Item List Import */}
         {showMasterImport && (
