@@ -232,11 +232,20 @@ app.get('/api/inventory', auth, async (req, res) => {
 const INV_FIELDS = `name, quantity, unit, secondary_quantity, secondary_unit, godown, date_added, added_by, price, hsn, builty_number, transporter, remarks, stock_type, category, opening_quantity`;
 const INV_VALS  = `$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16`;
 
-const logLedger = (client, { name, godown, movement_type, quantity, unit, reference, remarks, action_by, action_date }) =>
+// A day sheet can be built for any date, not just today. When entry_date is a
+// YYYY-MM-DD string the movement is stamped at midday IST on that date, so
+// /api/daily-receipts -- which buckets by created_at in IST -- files it under
+// the day the stock actually arrived rather than the day it was typed in.
+const IST_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+const logLedger = (client, { name, godown, movement_type, quantity, unit, reference, remarks, action_by, action_date, entry_date }) =>
   client.query(
-    `INSERT INTO stock_ledger (name, godown, movement_type, quantity, unit, reference, remarks, action_by, action_date)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-    [name, godown, movement_type, quantity, unit || 'pcs', reference || '', remarks || '', action_by, action_date || new Date().toLocaleDateString()]
+    `INSERT INTO stock_ledger (name, godown, movement_type, quantity, unit, reference, remarks, action_by, action_date, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,
+             COALESCE(($10::date + TIME '12:00') AT TIME ZONE 'Asia/Kolkata', NOW()))`,
+    [name, godown, movement_type, quantity, unit || 'pcs', reference || '', remarks || '', action_by,
+     action_date || new Date().toLocaleDateString(),
+     IST_DATE_RE.test(entry_date || '') ? entry_date : null]
   );
 
 // Add stock to an existing (name, godown) row if one exists, otherwise create it.
@@ -245,7 +254,7 @@ const logLedger = (client, { name, godown, movement_type, quantity, unit, refere
 async function upsertInventory(client, item, addedBy) {
   const {
     name, quantity, unit, secondary_quantity, secondary_unit, godown, dateAdded,
-    price, hsn, builty_number, transporter, remarks, stock_type, category
+    price, hsn, builty_number, transporter, remarks, stock_type, category, entry_date
   } = item;
   const qty = parseFloat(quantity) || 0;
   const secQty = parseFloat(secondary_quantity) || 0;
@@ -274,7 +283,7 @@ async function upsertInventory(client, item, addedBy) {
        hsn || 'N/A', builty_number || '', transporter || '', remarks || '',
        category || '', newOpeningQty, row.id]
     );
-    await logLedger(client, { name: row.name, godown, movement_type: movementType, quantity: qty, unit: row.unit, reference: ref, remarks, action_by: addedBy, action_date: dateAdded });
+    await logLedger(client, { name: row.name, godown, movement_type: movementType, quantity: qty, unit: row.unit, reference: ref, remarks, action_by: addedBy, action_date: dateAdded, entry_date });
     return updated[0];
   }
 
@@ -285,7 +294,7 @@ async function upsertInventory(client, item, addedBy) {
      price || 0, hsn || 'N/A', builty_number || '', transporter || '', remarks || '',
      stock_type || 'regular', category || '', stock_type === 'opening' ? qty : 0]
   );
-  await logLedger(client, { name: inserted[0].name, godown, movement_type: movementType, quantity: qty, unit: inserted[0].unit, reference: ref, remarks, action_by: addedBy, action_date: dateAdded });
+  await logLedger(client, { name: inserted[0].name, godown, movement_type: movementType, quantity: qty, unit: inserted[0].unit, reference: ref, remarks, action_by: addedBy, action_date: dateAdded, entry_date });
   return inserted[0];
 }
 
