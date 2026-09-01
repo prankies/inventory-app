@@ -7,6 +7,82 @@ const { Pool } = require('pg');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// Express 4 does not catch a rejected promise from an async handler, and Node
+// exits the process on an unhandled rejection -- so one database hiccup used to
+// take the whole app down. Wrapping the route-registration methods catches
+// every handler, including any added later, without touching each route.
+for (const method of ['get', 'post', 'put', 'delete', 'patch']) {
+  const register = app[method].bind(app);
+  app[method] = (path, ...handlers) => register(path, ...handlers.map(h =>
+    (typeof h === 'function' && h.length < 4)
+      ? (req, res, next) => Promise.resolve(h(req, res, next)).catch(next)
+      : h));
+}
+
+// ---- Passwords --------------------------------------------------------------
+// scrypt via the built-in crypto module: no new dependency, and the salt and
+// parameters travel with the hash so it can be changed later without a
+// migration. Rows written before this existed are plain text and are upgraded
+// transparently the next time that user signs in successfully.
+const PW_KEYLEN = 64;
+
+const hashPassword = (plain) => {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const dk = crypto.scryptSync(String(plain), salt, PW_KEYLEN).toString('hex');
+  return `scrypt$${salt}$${dk}`;
+};
+
+const isLegacyPassword = (stored) => !String(stored || '').startsWith('scrypt$');
+
+const verifyPassword = (plain, stored) => {
+  if (!stored) return false;
+  try {
+    if (isLegacyPassword(stored)) {
+      const a = Buffer.from(String(plain));
+      const b = Buffer.from(String(stored));
+      return a.length === b.length && crypto.timingSafeEqual(a, b);
+    }
+    const [, salt, dk] = String(stored).split('$');
+    // A malformed digest must never authenticate. Buffer.from('', 'hex') and
+    // Buffer.from('zz', 'hex') both yield an EMPTY buffer, and scryptSync with
+    // keylen 0 yields another -- timingSafeEqual would then call them equal and
+    // let any password through. Insist on a full-length hex digest first.
+    const HEX = /^[0-9a-f]+$/i;
+    if (!salt || !dk || !HEX.test(salt) || !HEX.test(dk) || dk.length !== PW_KEYLEN * 2) return false;
+    const want = Buffer.from(dk, 'hex');
+    if (want.length !== PW_KEYLEN) return false;
+    const got = crypto.scryptSync(String(plain), salt, want.length);
+    return crypto.timingSafeEqual(got, want);
+  } catch (e) {
+    return false;
+  }
+};
+
+// ---- Login throttle ---------------------------------------------------------
+// Small in-memory counter -- enough to stop credential stuffing against a
+// single-instance deployment. Cleared on restart, which is acceptable.
+const LOGIN_MAX_FAILURES = 6;
+const LOGIN_LOCKOUT_MS = 15 * 60 * 1000;
+const loginFailures = new Map();
+
+const loginKey = (req, email) => `${req.ip}|${String(email || '').toLowerCase()}`;
+
+const loginLockedFor = (key) => {
+  const rec = loginFailures.get(key);
+  if (!rec) return 0;
+  if (Date.now() - rec.at > LOGIN_LOCKOUT_MS) { loginFailures.delete(key); return 0; }
+  if (rec.count < LOGIN_MAX_FAILURES) return 0;
+  return Math.ceil((LOGIN_LOCKOUT_MS - (Date.now() - rec.at)) / 60000);
+};
+
+const noteLoginFailure = (key) => {
+  const rec = loginFailures.get(key);
+  if (!rec || Date.now() - rec.at > LOGIN_LOCKOUT_MS) loginFailures.set(key, { count: 1, at: Date.now() });
+  else { rec.count++; rec.at = Date.now(); }
+};
+
+const SESSION_DAYS = parseInt(process.env.SESSION_DAYS || '30', 10);
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
@@ -47,7 +123,9 @@ const seedLedgerFromInventory = async () => {
     const { rows: [agg] } = await pool.query(
       `SELECT
          COUNT(*) FILTER (WHERE reference = 'SYSTEM-SEED') AS seed_count,
-         COALESCE(SUM(CASE WHEN movement_type IN ('IN','OPENING','TRANSFER-IN') THEN quantity ELSE -quantity END), 0) AS net
+         COALESCE(SUM(CASE WHEN movement_type = 'ADJUST' THEN quantity
+                           WHEN movement_type IN ('IN','OPENING','TRANSFER-IN') THEN quantity
+                           ELSE -quantity END), 0) AS net
        FROM stock_ledger WHERE LOWER(name)=LOWER($1) AND godown=$2`,
       [it.name, it.godown]
     );
@@ -146,6 +224,28 @@ const initDB = async () => {
       quantity REAL NOT NULL,
       unit TEXT DEFAULT 'pcs'
     );
+    CREATE TABLE IF NOT EXISTS stock_verifications (
+      id SERIAL PRIMARY KEY,
+      godown TEXT NOT NULL,
+      verify_date TEXT NOT NULL,
+      note TEXT DEFAULT '',
+      full_count BOOLEAN DEFAULT FALSE,
+      items_counted INTEGER DEFAULT 0,
+      items_adjusted INTEGER DEFAULT 0,
+      net_change REAL DEFAULT 0,
+      verified_by TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS stock_verification_lines (
+      id SERIAL PRIMARY KEY,
+      verification_id INTEGER NOT NULL REFERENCES stock_verifications(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      godown TEXT NOT NULL,
+      unit TEXT DEFAULT 'pcs',
+      system_qty REAL NOT NULL,
+      counted_qty REAL NOT NULL,
+      difference REAL NOT NULL
+    );
   `);
 
   // Add new columns to existing table if they don't exist
@@ -161,9 +261,22 @@ const initDB = async () => {
     "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS opening_quantity REAL DEFAULT 0",
     "ALTER TABLE master_items ADD COLUMN IF NOT EXISTS secondary_unit TEXT DEFAULT ''",
     "ALTER TABLE master_items ADD COLUMN IF NOT EXISTS conversion REAL DEFAULT 0",
+    // Sessions now expire. Existing tokens are given a full term rather than
+    // being cut off, so nobody is signed out by the upgrade itself.
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ",
+    `UPDATE sessions SET expires_at = NOW() + INTERVAL '${SESSION_DAYS} days' WHERE expires_at IS NULL`,
+    // Roles. The column is added without a default first, so only rows that
+    // existed BEFORE this upgrade come out NULL -- those are the accounts you
+    // already trust, and they are promoted to admin. Everyone created after
+    // this defaults to staff. Idempotent: later boots find no NULLs.
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT",
+    "UPDATE users SET role = 'admin' WHERE role IS NULL",
+    "ALTER TABLE users ALTER COLUMN role SET DEFAULT 'staff'",
   ];
   for (const sql of alterCols) {
-    try { await pool.query(sql); } catch(e) { /* ignore */ }
+    try { await pool.query(sql); }
+    catch (e) { console.error('Migration step failed:', sql.slice(0, 70), '->', e.message); }
   }
 
   // One-time cleanup: merge any pre-existing duplicate rows for the same
@@ -193,29 +306,137 @@ app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'build', 'index.htm
 const auth = async (req, res, next) => {
   const token = req.headers['authorization'];
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
-  const { rows } = await pool.query('SELECT * FROM sessions WHERE token = $1', [token]);
+  const { rows } = await pool.query(
+    `SELECT s.email, s.expires_at, u.role
+     FROM sessions s LEFT JOIN users u ON u.email = s.email
+     WHERE s.token = $1`,
+    [token]
+  );
   if (!rows.length) return res.status(401).json({ error: 'Invalid token' });
-  req.user = { email: rows[0].email };
+  if (rows[0].expires_at && new Date(rows[0].expires_at) < new Date()) {
+    await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
+    return res.status(401).json({ error: 'Session expired. Please sign in again.' });
+  }
+  req.user = { email: rows[0].email, role: rows[0].role || 'staff' };
+  // Sliding expiry, so an account in daily use is never signed out mid-task --
+  // but only refreshed once the term is more than half spent, to avoid a
+  // database write on every request.
+  const remaining = rows[0].expires_at ? new Date(rows[0].expires_at) - Date.now() : 0;
+  if (remaining < (SESSION_DAYS * 24 * 60 * 60 * 1000) / 2) {
+    pool.query(
+      `UPDATE sessions SET expires_at = NOW() + INTERVAL '${SESSION_DAYS} days' WHERE token = $1`,
+      [token]
+    ).catch(() => {});
+  }
+  next();
+};
+
+// Destructive and account-management actions are owner-only. Every account that
+// existed before roles were introduced is an admin, so nothing you do today
+// changes; only newly created staff accounts are limited.
+const requireAdmin = (req, res, next) => {
+  if (req.user?.role !== 'admin') {
+    return res.status(403).json({ error: 'Only an owner account can do this.' });
+  }
   next();
 };
 
 // Auth
+// Public signup is closed. It stays available only while there are no accounts
+// at all, so a fresh deployment can create its first owner; after that, accounts
+// are created by an owner through POST /api/users.
 app.post('/api/signup', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  const { rows: [{ count }] } = await pool.query('SELECT COUNT(*)::int AS count FROM users');
+  if (count > 0 && process.env.ALLOW_SIGNUP !== '1') {
+    return res.status(403).json({ error: 'Sign-up is closed. Ask the owner to create your account.' });
+  }
+  if (String(password).length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  }
   try {
-    await pool.query('INSERT INTO users (email, password) VALUES ($1, $2)', [email, password]);
+    await pool.query('INSERT INTO users (email, password, role) VALUES ($1, $2, $3)',
+      [email, hashPassword(password), count === 0 ? 'admin' : 'staff']);
     res.json({ message: 'Account created! Now sign in.' });
   } catch { res.status(400).json({ error: 'Email already exists' }); }
 });
 
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
-  const { rows } = await pool.query('SELECT * FROM users WHERE email = $1 AND password = $2', [email, password]);
-  if (!rows.length) return res.status(401).json({ error: 'Invalid credentials' });
+  const key = loginKey(req, email);
+  const lockedMins = loginLockedFor(key);
+  if (lockedMins) {
+    return res.status(429).json({ error: `Too many failed attempts. Try again in ${lockedMins} minute(s).` });
+  }
+
+  const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+  const user = rows[0];
+  if (!user || !verifyPassword(password, user.password)) {
+    noteLoginFailure(key);
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  loginFailures.delete(key);
+
+  // Upgrade the stored password in place the first time a legacy account signs
+  // in correctly, so plain text disappears without anyone having to reset.
+  if (isLegacyPassword(user.password)) {
+    await pool.query('UPDATE users SET password = $1 WHERE id = $2', [hashPassword(password), user.id]);
+  }
+
   const token = crypto.randomBytes(32).toString('hex');
-  await pool.query('INSERT INTO sessions (token, email) VALUES ($1, $2)', [token, email]);
-  res.json({ token, email });
+  await pool.query(
+    `INSERT INTO sessions (token, email, expires_at) VALUES ($1, $2, NOW() + INTERVAL '${SESSION_DAYS} days')`,
+    [token, user.email]
+  );
+  res.json({ token, email: user.email, role: user.role || 'staff' });
+});
+
+// ---- Accounts ---------------------------------------------------------------
+app.get('/api/users', auth, requireAdmin, async (req, res) => {
+  const { rows } = await pool.query('SELECT id, email, role FROM users ORDER BY id');
+  res.json(rows);
+});
+
+app.post('/api/users', auth, requireAdmin, async (req, res) => {
+  const { email, password, role } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  if (String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  const wanted = role === 'admin' ? 'admin' : 'staff';
+  try {
+    const { rows: [row] } = await pool.query(
+      'INSERT INTO users (email, password, role) VALUES ($1,$2,$3) RETURNING id, email, role',
+      [email, hashPassword(password), wanted]
+    );
+    res.json(row);
+  } catch (e) {
+    res.status(400).json({ error: 'That email already has an account' });
+  }
+});
+
+app.delete('/api/users/:id', auth, requireAdmin, async (req, res) => {
+  const { rows: [target] } = await pool.query('SELECT email FROM users WHERE id = $1', [req.params.id]);
+  if (!target) return res.status(404).json({ error: 'No such account' });
+  if (target.email === req.user.email) return res.status(400).json({ error: 'You cannot delete your own account' });
+  await pool.query('DELETE FROM sessions WHERE email = $1', [target.email]);
+  await pool.query('DELETE FROM users WHERE id = $1', [req.params.id]);
+  res.json({ message: 'Account removed' });
+});
+
+// Anyone can change their OWN password; doing so signs out every other device.
+app.post('/api/change-password', auth, async (req, res) => {
+  const { current_password, new_password } = req.body;
+  if (String(new_password || '').length < 8) {
+    return res.status(400).json({ error: 'New password must be at least 8 characters' });
+  }
+  const { rows: [user] } = await pool.query('SELECT * FROM users WHERE email = $1', [req.user.email]);
+  if (!user || !verifyPassword(current_password, user.password)) {
+    return res.status(401).json({ error: 'Current password is wrong' });
+  }
+  await pool.query('UPDATE users SET password = $1 WHERE id = $2', [hashPassword(new_password), user.id]);
+  await pool.query('DELETE FROM sessions WHERE email = $1 AND token <> $2',
+    [req.user.email, req.headers['authorization']]);
+  res.json({ message: 'Password changed' });
 });
 
 app.post('/api/logout', auth, async (req, res) => {
@@ -506,7 +727,8 @@ app.get('/api/ledger', auth, async (req, res) => {
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const { rows } = await pool.query(
     `SELECT sl.*,
-       SUM(CASE WHEN sl.movement_type IN ('IN','OPENING','TRANSFER-IN') THEN sl.quantity
+       SUM(CASE WHEN sl.movement_type = 'ADJUST' THEN sl.quantity
+                WHEN sl.movement_type IN ('IN','OPENING','TRANSFER-IN') THEN sl.quantity
                 ELSE -sl.quantity END)
        OVER (PARTITION BY LOWER(sl.name), sl.godown ORDER BY sl.created_at, sl.id) AS running_balance
      FROM stock_ledger sl
@@ -554,7 +776,7 @@ app.put('/api/inventory/:id/issue', auth, async (req, res) => {
   res.json(updated[0]);
 });
 
-app.delete('/api/inventory/:id', auth, async (req, res) => {
+app.delete('/api/inventory/:id', auth, requireAdmin, async (req, res) => {
   await pool.query('DELETE FROM inventory WHERE id = $1', [req.params.id]);
   res.json({ message: 'Deleted' });
 });
@@ -623,7 +845,7 @@ app.post('/api/godowns', auth, async (req, res) => {
 });
 
 // Rename godown
-app.put('/api/godowns/:oldName', auth, async (req, res) => {
+app.put('/api/godowns/:oldName', auth, requireAdmin, async (req, res) => {
   const { newName } = req.body;
   const oldName = decodeURIComponent(req.params.oldName);
   try {
@@ -634,13 +856,170 @@ app.put('/api/godowns/:oldName', auth, async (req, res) => {
 });
 
 // Delete godown
-app.delete('/api/godowns/:name', auth, async (req, res) => {
+app.delete('/api/godowns/:name', auth, requireAdmin, async (req, res) => {
   const name = decodeURIComponent(req.params.name);
   await pool.query('DELETE FROM godowns WHERE name=$1', [name]);
   res.json({ message: 'Deleted' });
 });
 
 // AI Extract
+// ---- Physical stock verification -------------------------------------------
+// A count sheet for one godown: every item the system thinks is there, so the
+// floor figure can be typed straight against it.
+app.get('/api/verification/sheet', auth, async (req, res) => {
+  const { godown } = req.query;
+  if (!godown) return res.status(400).json({ error: 'Godown is required' });
+  const { rows } = await pool.query(
+    `SELECT id, name, unit, quantity AS system_qty, category
+     FROM inventory WHERE godown = $1 ORDER BY LOWER(name)`,
+    [godown]
+  );
+  res.json(rows);
+});
+
+// Post a count. Items left blank are NOT counted and are left untouched, unless
+// full_count says the whole godown was walked -- then a blank means zero.
+// Every difference becomes a signed ADJUST ledger row, so the ledger says
+// plainly that stock was corrected by a count and never disguises it as a
+// receipt or an issue.
+app.post('/api/verification', auth, async (req, res) => {
+  const { godown, verify_date, note, full_count, lines, new_items } = req.body;
+  const extras = Array.isArray(new_items) ? new_items : [];
+  if (!godown) return res.status(400).json({ error: 'Godown is required' });
+  if ((!Array.isArray(lines) || !lines.length) && !extras.length) {
+    return res.status(400).json({ error: 'Nothing counted' });
+  }
+  const vdate = IST_DATE_RE.test(verify_date || '') ? verify_date : null;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: stock } = await client.query(
+      'SELECT id, name, unit, quantity FROM inventory WHERE godown = $1 FOR UPDATE',
+      [godown]
+    );
+    const byName = new Map(stock.map(r => [r.name.toLowerCase(), r]));
+
+    let counted = 0, adjusted = 0, net = 0;
+    const applied = [];
+
+    for (const line of (Array.isArray(lines) ? lines : [])) {
+      const row = byName.get(String(line.name || '').toLowerCase());
+      if (!row) continue;                                  // item not in this godown
+      const raw = line.counted;
+      const blank = raw === '' || raw === null || raw === undefined;
+      if (blank && !full_count) continue;                  // not counted -- leave alone
+      const countedQty = blank ? 0 : parseFloat(raw);
+      if (!isFinite(countedQty) || countedQty < 0) continue;
+
+      counted++;
+      const diff = +(countedQty - row.quantity).toFixed(3);
+      if (diff === 0) continue;
+
+      adjusted++;
+      net += diff;
+      await client.query('UPDATE inventory SET quantity = $1 WHERE id = $2', [countedQty, row.id]);
+      await logLedger(client, {
+        name: row.name, godown, movement_type: 'ADJUST',
+        quantity: diff,                                    // signed: negative = short
+        unit: row.unit,
+        reference: `VERIFY-${vdate || 'today'}-${godown}`,
+        remarks: `Physical count ${countedQty} vs system ${row.quantity}${note ? ' -- ' + note : ''}`,
+        action_by: req.user.email,
+        action_date: vdate || new Date().toLocaleDateString(),
+        entry_date: vdate,
+      });
+      applied.push({ name: row.name, unit: row.unit, system_qty: row.quantity, counted_qty: countedQty, difference: diff });
+    }
+
+    // Stock standing on the floor that the system has never heard of. The count
+    // is the first time it is seen, so the item is created here at zero and the
+    // whole quantity is posted as a single ADJUST -- same as any other
+    // difference, rather than being back-dated as a receipt that never happened.
+    for (const extra of extras) {
+      const name = String(extra.name || '').trim();
+      if (!name) continue;
+      const qty = parseFloat(extra.counted);
+      if (!isFinite(qty) || qty <= 0) continue;
+
+      const known = byName.get(name.toLowerCase());
+      if (known) {                                   // it was on the sheet after all
+        const diff = +(qty - known.quantity).toFixed(3);
+        counted++;
+        if (diff !== 0) {
+          adjusted++; net += diff;
+          await client.query('UPDATE inventory SET quantity = $1 WHERE id = $2', [qty, known.id]);
+          await logLedger(client, {
+            name: known.name, godown, movement_type: 'ADJUST', quantity: diff, unit: known.unit,
+            reference: `VERIFY-${vdate || 'today'}-${godown}`,
+            remarks: `Physical count ${qty} vs system ${known.quantity}${note ? ' -- ' + note : ''}`,
+            action_by: req.user.email, action_date: vdate || new Date().toLocaleDateString(), entry_date: vdate,
+          });
+          applied.push({ name: known.name, unit: known.unit, system_qty: known.quantity, counted_qty: qty, difference: diff });
+        }
+        continue;
+      }
+
+      const unit = (extra.unit || 'pcs').trim() || 'pcs';
+      const { rows: [created] } = await client.query(
+        `INSERT INTO inventory (name, quantity, unit, godown, date_added, added_by, stock_type)
+         VALUES ($1,$2,$3,$4,$5,$6,'regular') RETURNING *`,
+        [name, qty, unit, godown, vdate || new Date().toLocaleDateString(), req.user.email]
+      );
+      byName.set(name.toLowerCase(), { id: created.id, name: created.name, unit: created.unit, quantity: qty });
+
+      counted++; adjusted++; net += qty;
+      await logLedger(client, {
+        name: created.name, godown, movement_type: 'ADJUST', quantity: qty, unit,
+        reference: `VERIFY-${vdate || 'today'}-${godown}`,
+        remarks: `Found on floor during count, not previously in system${note ? ' -- ' + note : ''}`,
+        action_by: req.user.email, action_date: vdate || new Date().toLocaleDateString(), entry_date: vdate,
+      });
+      applied.push({ name: created.name, unit, system_qty: 0, counted_qty: qty, difference: qty, is_new: true });
+    }
+
+    const { rows: [header] } = await client.query(
+      `INSERT INTO stock_verifications (godown, verify_date, note, full_count, items_counted, items_adjusted, net_change, verified_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [godown, vdate || new Date().toISOString().split('T')[0], note || '', !!full_count,
+       counted, adjusted, +net.toFixed(3), req.user.email]
+    );
+    for (const a of applied) {
+      await client.query(
+        `INSERT INTO stock_verification_lines (verification_id, name, godown, unit, system_qty, counted_qty, difference)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [header.id, a.name, godown, a.unit || 'pcs', a.system_qty, a.counted_qty, a.difference]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ ...header, lines: applied });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/verifications', auth, async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT * FROM stock_verifications ORDER BY created_at DESC LIMIT 100'
+  );
+  res.json(rows);
+});
+
+app.get('/api/verifications/:id', auth, async (req, res) => {
+  const { rows: [header] } = await pool.query('SELECT * FROM stock_verifications WHERE id = $1', [req.params.id]);
+  if (!header) return res.status(404).json({ error: 'Verification not found' });
+  const { rows: lines } = await pool.query(
+    'SELECT * FROM stock_verification_lines WHERE verification_id = $1 ORDER BY LOWER(name)',
+    [req.params.id]
+  );
+  res.json({ ...header, lines });
+});
+
 app.post('/api/extract', auth, async (req, res) => {
   const { text, imageBase64, mediaType } = req.body;
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -663,6 +1042,14 @@ No other text.`;
     if (!match) return res.status(500).json({ error: 'Could not parse response' });
     res.json({ items: JSON.parse(match[0]) });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Must sit after every route: the wrapper above funnels rejected handlers here
+// instead of letting them become unhandled rejections.
+app.use((err, req, res, next) => {
+  console.error(`${req.method} ${req.originalUrl} failed:`, err && err.message);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'Something went wrong. Please try again.' });
 });
 
 initDB().then(() => {

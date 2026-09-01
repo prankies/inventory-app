@@ -13,6 +13,8 @@ const shiftYmd = (s, n) => { const d = parseYmd(s); d.setDate(d.getDate() + n); 
 
 const InventoryApp = () => {
   const [currentUser, setCurrentUser] = useState(null);
+  const [currentRole, setCurrentRole] = useState('staff');
+  const isAdmin = currentRole === 'admin';
   const [token, setToken] = useState(null);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -78,6 +80,23 @@ const InventoryApp = () => {
   const [showDaily, setShowDaily] = useState(false);
   const [dailyReceipts, setDailyReceipts] = useState([]);
   const [dailyDate, setDailyDate] = useState(istToday());   // the day sheet being worked on
+
+  // Physical stock verification
+  const [showVerify, setShowVerify] = useState(false);
+  const [vGodown, setVGodown] = useState('');
+  const [vDate, setVDate] = useState(istToday());
+  const [vNote, setVNote] = useState('');
+  const [vFullCount, setVFullCount] = useState(false);
+  const [vSheet, setVSheet] = useState([]);        // [{name, unit, system_qty}]
+  const [vCounts, setVCounts] = useState({});      // name -> typed string
+  const [vLoading, setVLoading] = useState(false);
+  const [vSaving, setVSaving] = useState(false);
+  const [vHistory, setVHistory] = useState([]);
+  const [vSearch, setVSearch] = useState('');
+  const [vNewItems, setVNewItems] = useState([]);   // found on the floor, unknown to the system
+  const [vnName, setVnName] = useState('');
+  const [vnQty, setVnQty] = useState('');
+  const [vnUnit, setVnUnit] = useState('pcs');
   const [drItem, setDrItem] = useState('');
   const [drQty, setDrQty] = useState('');
   const [drUnit, setDrUnit] = useState('pcs');
@@ -112,9 +131,21 @@ const InventoryApp = () => {
 
   const authHeaders = useCallback(() => ({ 'Content-Type': 'application/json', 'Authorization': token }), [token]);
 
+  // Sessions expire now, so a 401 has to sign the user out rather than quietly
+  // rendering an empty warehouse.
+  const signOutLocal = (msg) => {
+    localStorage.removeItem('inv_token');
+    localStorage.removeItem('inv_user');
+    localStorage.removeItem('inv_role');
+    setCurrentUser(null); setToken(null); setCurrentRole('staff');
+    setInventory([]); setGodowns([]);
+    if (msg) setAuthError(msg);
+  };
+
   const loadInventory = useCallback(async (tok) => {
     const t = tok || token;
     const res = await fetch(`${API}/inventory`, { headers: { Authorization: t } });
+    if (res.status === 401) { signOutLocal('Your session has expired. Please sign in again.'); return; }
     const data = await res.json();
     setInventory(Array.isArray(data) ? data : []);
   }, [token]);
@@ -158,12 +189,94 @@ const InventoryApp = () => {
     setDailyReceipts(Array.isArray(data) ? data : []);
   }, [token, dailyDate]);
 
+  const loadVerifySheet = async (godown) => {
+    if (!godown) { setVSheet([]); return; }
+    setVLoading(true);
+    const res = await fetch(`${API}/verification/sheet?godown=${encodeURIComponent(godown)}`, { headers: { Authorization: token } });
+    const data = await res.json();
+    setVSheet(Array.isArray(data) ? data : []);
+    setVCounts({});
+    setVNewItems([]);
+    setVLoading(false);
+  };
+
+  const loadVerifyHistory = useCallback(async () => {
+    const res = await fetch(`${API}/verifications`, { headers: { Authorization: token } });
+    const data = await res.json();
+    setVHistory(Array.isArray(data) ? data : []);
+  }, [token]);
+
+  // A blank box means "not counted" and is left alone, unless the whole godown
+  // was walked -- then blank means the item genuinely was not there.
+  const verifyStats = () => {
+    let counted = 0, matched = 0, short = 0, excess = 0;
+    vSheet.forEach((r) => {
+      const raw = vCounts[r.name];
+      const blank = raw === undefined || raw === '';
+      if (blank && !vFullCount) return;
+      const c = blank ? 0 : parseFloat(raw);
+      if (!isFinite(c) || c < 0) return;
+      counted++;
+      const d = +(c - r.system_qty).toFixed(3);
+      if (d === 0) matched++; else if (d < 0) short++; else excess++;
+    });
+    const uncounted = vSheet.length - counted;
+    // Items found on the floor are counted and, by definition, all excess.
+    counted += vNewItems.length;
+    excess += vNewItems.length;
+    return { counted, matched, short, excess, uncounted, found: vNewItems.length };
+  };
+
+  const addFoundItem = () => {
+    const name = vnName.trim();
+    const qty = parseFloat(vnQty);
+    if (!name) { alert('Enter the item name'); return; }
+    if (!isFinite(qty) || qty <= 0) { alert('Enter a quantity greater than zero'); return; }
+    if (vSheet.some(r => r.name.toLowerCase() === name.toLowerCase())) {
+      alert(`"${name}" is already on the count sheet below — type its figure in the Counted box instead.`);
+      return;
+    }
+    if (vNewItems.some(r => r.name.toLowerCase() === name.toLowerCase())) {
+      alert(`"${name}" has already been added.`); return;
+    }
+    setVNewItems([...vNewItems, { name, counted: String(qty), unit: vnUnit }]);
+    setVnName(''); setVnQty('');
+  };
+
+  const saveVerification = async () => {
+    const stats = verifyStats();
+    if (!vGodown) { alert('Select a godown'); return; }
+    if (!stats.counted) { alert('Nothing counted yet -- type at least one figure.'); return; }
+    const changing = stats.short + stats.excess;
+    const foundLine = stats.found ? `\n${stats.found} new item(s) will be created in ${vGodown}.` : '';
+    const msg = vFullCount
+      ? `Post this count for ${vGodown}?\n\n${stats.counted} item(s) counted, ${changing} will be corrected.${foundLine}\n\nBlank boxes are treated as ZERO because "counted the whole godown" is ticked.`
+      : `Post this count for ${vGodown}?\n\n${stats.counted} item(s) counted, ${changing} will be corrected.${foundLine}\n${stats.uncounted} left blank and untouched.`;
+    if (!window.confirm(msg)) return;
+
+    setVSaving(true);
+    const lines = vSheet.map((r) => ({ name: r.name, counted: vCounts[r.name] === undefined ? '' : vCounts[r.name] }));
+    const res = await fetch(`${API}/verification`, {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({ godown: vGodown, verify_date: vDate, note: vNote, full_count: vFullCount, lines, new_items: vNewItems }),
+    });
+    const data = await res.json();
+    setVSaving(false);
+    if (!res.ok) { alert('Failed: ' + (data.error || 'unknown error')); return; }
+    await loadInventory();
+    await loadVerifyHistory();
+    await loadVerifySheet(vGodown);
+    setVNewItems([]);
+    setVNote('');
+    alert(`Verification saved.\n\n${data.items_counted} counted, ${data.items_adjusted} corrected, net change ${data.net_change > 0 ? '+' : ''}${data.net_change}.`);
+  };
+
   // Accordion: opening one tool panel closes the others so they don't stack
   const togglePanel = (name) => {
     const state = {
       master: showMasterImport, issue: showIssueSlip, transfer: showTransfer,
       upload: showUpload, import: showImport, ledger: showLedger,
-      godowns: editingGodowns, daily: showDaily,
+      godowns: editingGodowns, daily: showDaily, verify: showVerify,
     };
     const willOpen = !state[name];
     setShowMasterImport(name === 'master' && willOpen);
@@ -174,7 +287,9 @@ const InventoryApp = () => {
     setShowLedger(name === 'ledger' && willOpen);
     setEditingGodowns(name === 'godowns' && willOpen);
     setShowDaily(name === 'daily' && willOpen);
+    setShowVerify(name === 'verify' && willOpen);
     if (willOpen && name === 'ledger') loadLedger();
+    if (willOpen && name === 'verify') loadVerifyHistory();
     // the day sheet loads itself from the showDaily/dailyDate effect below
   };
 
@@ -187,6 +302,7 @@ const InventoryApp = () => {
     const savedUser = localStorage.getItem('inv_user');
     if (savedToken && savedUser) {
       setToken(savedToken); setCurrentUser(savedUser);
+      setCurrentRole(localStorage.getItem('inv_role') || 'staff');
       loadInventory(savedToken); loadGodowns(savedToken); loadCategories(savedToken);
     }
   }, [loadInventory, loadGodowns, loadCategories]);
@@ -252,8 +368,9 @@ const InventoryApp = () => {
     const res = await fetch(`${API}/login`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email,password}) });
     const data = await res.json();
     if (!res.ok) { setAuthError(data.error); return; }
-    setToken(data.token); setCurrentUser(data.email);
+    setToken(data.token); setCurrentUser(data.email); setCurrentRole(data.role || 'staff');
     localStorage.setItem('inv_token', data.token); localStorage.setItem('inv_user', data.email);
+    localStorage.setItem('inv_role', data.role || 'staff');
     await loadInventory(data.token); await loadGodowns(data.token); await loadCategories(data.token);
     setEmail(''); setPassword('');
   };
@@ -268,8 +385,8 @@ const InventoryApp = () => {
 
   const handleLogout = async () => {
     await fetch(`${API}/logout`, { method:'POST', headers: authHeaders() });
-    localStorage.removeItem('inv_token'); localStorage.removeItem('inv_user');
-    setCurrentUser(null); setToken(null); setInventory([]); setGodowns([]);
+    localStorage.removeItem('inv_token'); localStorage.removeItem('inv_user'); localStorage.removeItem('inv_role');
+    setCurrentUser(null); setToken(null); setCurrentRole('staff'); setInventory([]); setGodowns([]);
   };
 
   const addItem = async (e) => {
@@ -693,9 +810,9 @@ const InventoryApp = () => {
             {isLogin ? '🔐 Sign In' : '✅ Create Account'}
           </button>
         </form>
-        <button onClick={()=>{setIsLogin(!isLogin);setAuthError('');}} style={{width:'100%',background:'none',border:'none',color:'#4f46e5',cursor:'pointer',fontSize:'14px',fontWeight:600}}>
-          {isLogin ? "Don't have an account? Sign up" : 'Already have an account? Sign in'}
-        </button>
+        <div style={{textAlign:'center',fontSize:13,color:'#94a3b8',marginTop:4}}>
+          Accounts are created by the owner. Ask for one if you don’t have a login.
+        </div>
       </div>
     </div>
   );
@@ -718,8 +835,9 @@ const InventoryApp = () => {
           <button className={`nav-btn ${showTransfer?'active':''}`} onClick={()=>togglePanel('transfer')}>🔄 Transfer</button>
           <button className={`nav-btn ${showUpload?'active':''}`} onClick={()=>togglePanel('upload')}>📤 Upload Bill</button>
           <button className={`nav-btn ${showImport?'active':''}`} onClick={()=>togglePanel('import')}>📊 Import CSV/XLS</button>
+          <button className={`nav-btn ${showVerify?'active':''}`} onClick={()=>togglePanel('verify')}>✅ Verify Stock</button>
           <button className={`nav-btn ${showLedger?'active':''}`} onClick={()=>togglePanel('ledger')}>📒 Ledger</button>
-          <button className={`nav-btn ${editingGodowns?'active':''}`} onClick={()=>togglePanel('godowns')}>🏭 Godowns</button>
+          {isAdmin && <button className={`nav-btn ${editingGodowns?'active':''}`} onClick={()=>togglePanel('godowns')}>🏭 Godowns</button>}
           <button className="nav-btn danger" onClick={handleLogout}>🚪 Sign Out</button>
         </div>
       </div>
@@ -840,6 +958,219 @@ const InventoryApp = () => {
                 </div>
               )}
             </div>
+          </div>
+        )}
+
+        {/* Physical Stock Verification */}
+        {showVerify && (
+          <div className="card" style={{border:'2px solid #16a34a'}}>
+            <div className="card-title" style={{justifyContent:'space-between'}}>
+              <span>✅ Physical Stock Verification</span>
+              {vSheet.length > 0 && (() => { const st = verifyStats(); return (
+                <div style={{display:'flex',gap:6,flexWrap:'wrap',fontSize:12,fontWeight:700}}>
+                  <span style={{background:'#eef2ff',color:'#4338ca',padding:'3px 10px',borderRadius:20}}>{st.counted} counted</span>
+                  <span style={{background:'#f0fdf4',color:'#166534',padding:'3px 10px',borderRadius:20}}>{st.matched} match</span>
+                  <span style={{background:'#fef2f2',color:'#dc2626',padding:'3px 10px',borderRadius:20}}>{st.short} short</span>
+                  <span style={{background:'#fff7ed',color:'#b45309',padding:'3px 10px',borderRadius:20}}>{st.excess} excess</span>
+                  <span style={{background:'#f1f5f9',color:'#64748b',padding:'3px 10px',borderRadius:20}}>{st.uncounted} not counted</span>
+                  {st.found > 0 && <span style={{background:'#ecfeff',color:'#0e7490',padding:'3px 10px',borderRadius:20}}>{st.found} found</span>}
+                </div>); })()}
+            </div>
+
+            <p style={{fontSize:13,color:'#64748b',marginBottom:14}}>
+              Count a godown on the floor and type the real figures below. Anything you leave blank is
+              treated as <strong>not counted</strong> and is left exactly as it is — so a partial count is safe.
+              Each difference is posted to the ledger as a signed <code>ADJUST</code> entry, never as a
+              receipt or an issue.
+            </p>
+
+            <div className="form-row-5a" style={{alignItems:'end'}}>
+              <div>
+                <label className="field-label">Godown *</label>
+                <select className="input" style={{marginBottom:0}} value={vGodown}
+                  onChange={e=>{ setVGodown(e.target.value); loadVerifySheet(e.target.value); }}>
+                  <option value="">Select godown</option>
+                  {godowns.map(g=><option key={g}>{g}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="field-label">Date counted</label>
+                <input className="input" style={{marginBottom:0}} type="date" value={vDate} max={istToday()}
+                  onChange={e=>setVDate(e.target.value || istToday())} />
+              </div>
+              <div style={{gridColumn:'span 2'}}>
+                <label className="field-label">Note (why this count was done)</label>
+                <input className="input" style={{marginBottom:0}} placeholder='e.g. "Fresh baseline — ledger incomplete before this"'
+                  value={vNote} onChange={e=>setVNote(e.target.value)} />
+              </div>
+              <div>
+                <label className="field-label">Search</label>
+                <input className="input" style={{marginBottom:0}} placeholder="Filter items"
+                  value={vSearch} onChange={e=>setVSearch(e.target.value)} />
+              </div>
+            </div>
+
+            <label style={{display:'flex',alignItems:'center',gap:8,marginTop:12,fontSize:13,fontWeight:600,color:'#b45309',cursor:'pointer'}}>
+              <input type="checkbox" checked={vFullCount} onChange={e=>setVFullCount(e.target.checked)} />
+              I walked the entire godown — treat every blank box as ZERO
+            </label>
+            {vFullCount && (
+              <div style={{marginTop:8,padding:'9px 13px',borderRadius:8,fontSize:13,fontWeight:600,background:'#fff7ed',color:'#b45309',border:'1px solid #fed7aa'}}>
+                Every item left blank will be written down to zero. Only tick this when the whole godown was counted.
+              </div>
+            )}
+
+            {vLoading && <div style={{textAlign:'center',padding:22,color:'#94a3b8'}}>Loading count sheet…</div>}
+
+            {!vLoading && vGodown && vSheet.length === 0 && (
+              <div style={{textAlign:'center',padding:'22px',marginTop:14,color:'#94a3b8',background:'#f8fafc',borderRadius:10,border:'1.5px dashed #cbd5e1'}}>
+                No stock recorded in {vGodown} yet — add whatever is standing there using “Found on the floor” below.
+              </div>
+            )}
+
+            {!vLoading && vGodown && (
+              <div style={{marginTop:16,padding:14,borderRadius:10,background:'#f8fafc',border:'1.5px dashed #94a3b8'}}>
+                <div style={{fontWeight:700,fontSize:13,color:'#334155',marginBottom:4}}>Found on the floor, not in the system</div>
+                <div style={{fontSize:12,color:'#64748b',marginBottom:10}}>
+                  Stock standing in {vGodown} that the count sheet does not list. It is created here at zero
+                  and the whole quantity posted as one ADJUST — not back-dated as a receipt that never happened.
+                </div>
+                <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'flex-end'}}>
+                  <div style={{flex:'2 1 220px'}}>
+                    <label className="field-label">Item name *</label>
+                    <input className="input" style={{marginBottom:0}} placeholder="Item name" value={vnName}
+                      list="verify-item-list" autoComplete="off"
+                      onChange={e=>setVnName(e.target.value)}
+                      onKeyDown={e=>{ if(e.key==='Enter'){ e.preventDefault(); addFoundItem(); } }} />
+                    <datalist id="verify-item-list">
+                      {[...new Set(inventory.map(i=>i.name))].sort().map(n=><option key={n} value={n}/>)}
+                    </datalist>
+                  </div>
+                  <div style={{flex:'1 1 100px'}}>
+                    <label className="field-label">Qty *</label>
+                    <input className="input" style={{marginBottom:0}} type="number" step="any" min="0" placeholder="Qty"
+                      value={vnQty} onChange={e=>setVnQty(e.target.value)}
+                      onKeyDown={e=>{ if(e.key==='Enter'){ e.preventDefault(); addFoundItem(); } }} />
+                  </div>
+                  <div style={{flex:'1 1 110px'}}>
+                    <label className="field-label">Unit</label>
+                    <select className="input" style={{marginBottom:0}} value={vnUnit} onChange={e=>setVnUnit(e.target.value)}>
+                      {UNITS.map(u=><option key={u}>{u}</option>)}
+                    </select>
+                  </div>
+                  <button className="btn btn-blue" type="button" onClick={addFoundItem}>➕ Add</button>
+                </div>
+
+                {vNewItems.length > 0 && (
+                  <div className="table-wrap" style={{marginTop:12}}>
+                    <table>
+                      <thead><tr><th>Item</th><th style={{textAlign:'right'}}>System</th><th>Unit</th>
+                        <th style={{textAlign:'right'}}>Counted</th><th style={{textAlign:'right'}}>Difference</th><th></th></tr></thead>
+                      <tbody>
+                        {vNewItems.map((r,i)=>(
+                          <tr key={r.name+i}>
+                            <td style={{fontWeight:600,color:'#0f172a'}}>{r.name}
+                              <span style={{marginLeft:8,background:'#ecfeff',color:'#0e7490',padding:'1px 8px',borderRadius:20,fontSize:11,fontWeight:700}}>NEW</span></td>
+                            <td style={{textAlign:'right',color:'#64748b'}}>0</td>
+                            <td style={{color:'#64748b',fontSize:12}}>{r.unit}</td>
+                            <td style={{textAlign:'right',fontWeight:600}}>{r.counted}</td>
+                            <td style={{textAlign:'right',fontWeight:700,color:'#b45309'}}>+{r.counted}</td>
+                            <td style={{textAlign:'right'}}>
+                              <button className="btn btn-red btn-sm" type="button"
+                                onClick={()=>setVNewItems(vNewItems.filter((_,k)=>k!==i))}>Remove</button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {!vLoading && (vSheet.length > 0 || vNewItems.length > 0) && (
+              <>
+                <div className="table-wrap" style={{marginTop:16,maxHeight:460,overflowY:'auto'}}>
+                  <table>
+                    <thead><tr>
+                      <th>#</th><th>Item</th><th style={{textAlign:'right'}}>System</th><th>Unit</th>
+                      <th style={{textAlign:'right'}}>Counted</th><th style={{textAlign:'right'}}>Difference</th>
+                    </tr></thead>
+                    <tbody>
+                      {vSheet
+                        .filter(r => !vSearch || r.name.toLowerCase().includes(vSearch.toLowerCase()))
+                        .map((r,i)=>{
+                          const raw = vCounts[r.name];
+                          const blank = raw === undefined || raw === '';
+                          const c = blank ? (vFullCount ? 0 : null) : parseFloat(raw);
+                          const d = (c === null || !isFinite(c)) ? null : +(c - r.system_qty).toFixed(3);
+                          return (
+                            <tr key={r.name+i}>
+                              <td style={{color:'#94a3b8'}}>{i+1}</td>
+                              <td style={{fontWeight:600,color:'#0f172a'}}>{r.name}</td>
+                              <td style={{textAlign:'right',color:'#64748b'}}>{r.system_qty}</td>
+                              <td style={{color:'#64748b',fontSize:12}}>{r.unit}</td>
+                              <td style={{textAlign:'right'}}>
+                                <input className="input" type="number" step="any" min="0" placeholder="—"
+                                  style={{marginBottom:0,width:110,textAlign:'right',padding:'6px 9px'}}
+                                  value={raw === undefined ? '' : raw}
+                                  onChange={e=>setVCounts({...vCounts, [r.name]: e.target.value})} />
+                              </td>
+                              <td style={{textAlign:'right',fontWeight:700,
+                                color: d === null ? '#cbd5e1' : d === 0 ? '#16a34a' : d < 0 ? '#dc2626' : '#b45309'}}>
+                                {d === null ? '—' : d > 0 ? `+${d}` : d}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div style={{display:'flex',gap:10,marginTop:14,flexWrap:'wrap'}}>
+                  <button className="btn btn-green" onClick={saveVerification} disabled={vSaving}>
+                    {vSaving ? 'Saving…' : '✅ Post Verification'}
+                  </button>
+                  <button className="btn btn-light" type="button" onClick={()=>setVCounts({})}>Clear counts</button>
+                  <button className="btn btn-light" type="button" onClick={()=>{
+                    const csv=[['Item','Unit','System Qty','Counted Qty'],
+                      ...vSheet.map(r=>[r.name,r.unit||'',r.system_qty,''])]
+                      .map(r=>r.map(v=>`"${v}"`).join(',')).join('\n');
+                    const a=document.createElement('a');
+                    a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+                    a.download=`count-sheet-${vGodown}-${vDate}.csv`; a.click();
+                  }}>📥 Blank count sheet</button>
+                </div>
+              </>
+            )}
+
+            {vHistory.length > 0 && (
+              <div style={{marginTop:22}}>
+                <div style={{fontWeight:700,fontSize:13,color:'#334155',marginBottom:8}}>Past verifications</div>
+                <div className="table-wrap">
+                  <table>
+                    <thead><tr><th>Date</th><th>Godown</th><th style={{textAlign:'right'}}>Counted</th>
+                      <th style={{textAlign:'right'}}>Corrected</th><th style={{textAlign:'right'}}>Net</th>
+                      <th>Note</th><th>By</th></tr></thead>
+                    <tbody>
+                      {vHistory.map(h=>(
+                        <tr key={h.id}>
+                          <td>{h.verify_date}</td>
+                          <td><span style={{background:'#eef2ff',color:'#4338ca',padding:'2px 10px',borderRadius:20,fontSize:12,fontWeight:600}}>{h.godown}</span></td>
+                          <td style={{textAlign:'right'}}>{h.items_counted}</td>
+                          <td style={{textAlign:'right',fontWeight:700}}>{h.items_adjusted}</td>
+                          <td style={{textAlign:'right',fontWeight:700,color: h.net_change < 0 ? '#dc2626' : h.net_change > 0 ? '#b45309' : '#16a34a'}}>
+                            {h.net_change > 0 ? `+${h.net_change}` : h.net_change}
+                          </td>
+                          <td style={{color:'#64748b',fontSize:12}}>{h.full_count ? '[full count] ' : ''}{h.note||'-'}</td>
+                          <td style={{color:'#64748b',fontSize:12}}>{h.verified_by}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -1106,6 +1437,7 @@ const InventoryApp = () => {
                   <option value="OUT">OUT (Issue)</option>
                   <option value="TRANSFER-IN">Transfer IN</option>
                   <option value="TRANSFER-OUT">Transfer OUT</option>
+                  <option value="ADJUST">Adjustment (count)</option>
                 </select>
               </div>
               <div>
@@ -1138,13 +1470,18 @@ const InventoryApp = () => {
                   </thead>
                   <tbody>
                     {ledgerRows.map(row => {
+                      const isAdjust = row.movement_type === 'ADJUST';
                       const isIn = ['IN','OPENING','TRANSFER-IN'].includes(row.movement_type);
+                      const qty = parseFloat(row.quantity);
+                      const qtyText = isAdjust ? (qty > 0 ? `+${qty}` : `${qty}`) : `${isIn ? '+' : '-'}${row.quantity}`;
+                      const qtyColor = isAdjust ? (qty < 0 ? '#dc2626' : '#b45309') : (isIn ? '#16a34a' : '#dc2626');
                       const typeColors = {
                         'IN':          {bg:'#dcfce7',color:'#166534'},
                         'OPENING':     {bg:'#fef3c7',color:'#92400e'},
                         'OUT':         {bg:'#fee2e2',color:'#991b1b'},
                         'TRANSFER-IN': {bg:'#dbeafe',color:'#1e40af'},
                         'TRANSFER-OUT':{bg:'#ede9fe',color:'#5b21b6'},
+                        'ADJUST':      {bg:'#fff7ed',color:'#b45309'},
                       };
                       const tc = typeColors[row.movement_type] || {bg:'#f1f5f9',color:'#475569'};
                       return (
@@ -1153,7 +1490,7 @@ const InventoryApp = () => {
                           <td style={{fontWeight:600}}>{row.name}</td>
                           <td style={{color:'#475569'}}>{row.godown}</td>
                           <td><span style={{background:tc.bg,color:tc.color,padding:'2px 8px',borderRadius:20,fontSize:11,fontWeight:700,whiteSpace:'nowrap'}}>{row.movement_type}</span></td>
-                          <td style={{textAlign:'right',fontWeight:600,color: isIn ? '#16a34a' : '#dc2626'}}>{isIn ? '+' : '-'}{row.quantity}</td>
+                          <td style={{textAlign:'right',fontWeight:600,color: qtyColor}}>{qtyText}</td>
                           <td style={{color:'#64748b',fontSize:12}}>{row.unit}</td>
                           <td style={{textAlign:'right',fontWeight:700}}>{parseFloat(row.running_balance).toFixed(2)}</td>
                           <td style={{color:'#64748b',fontSize:12}}>{row.reference || '-'}</td>
@@ -1504,7 +1841,7 @@ const InventoryApp = () => {
                     <td>
                       <div className="actions">
                         <button className="btn btn-orange btn-sm" onClick={()=>issueItem(item.id)}>📤 Issue</button>
-                        <button className="btn btn-red btn-sm" onClick={()=>deleteItem(item.id)}>🗑</button>
+                        {isAdmin && <button className="btn btn-red btn-sm" onClick={()=>deleteItem(item.id)}>🗑</button>}
                       </div>
                     </td>
                   </tr>
