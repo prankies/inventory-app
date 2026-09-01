@@ -83,6 +83,13 @@ const noteLoginFailure = (key) => {
 
 const SESSION_DAYS = parseInt(process.env.SESSION_DAYS || '30', 10);
 
+// Business dates are written as YYYY-MM-DD in IST. toLocaleDateString() was
+// producing whatever format the host machine happened to use ("8/16/2026" on
+// one box, "16/08/2026" on another), which cannot be sorted, range-filtered or
+// grouped by month. ISO text sorts correctly as a string, so this fixes
+// ordering without a risky rewrite of historical rows.
+const istDate = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
@@ -134,7 +141,7 @@ const seedLedgerFromInventory = async () => {
     await pool.query(
       `INSERT INTO stock_ledger (name, godown, movement_type, quantity, unit, reference, remarks, action_by, action_date, created_at)
        VALUES ($1,$2,'OPENING',$3,$4,'SYSTEM-SEED','Opening balance', 'system', $5, TIMESTAMPTZ '2000-01-01')`,
-      [it.name, it.godown, opening, it.unit || 'pcs', new Date().toLocaleDateString()]
+      [it.name, it.godown, opening, it.unit || 'pcs', istDate()]
     );
     seeded++;
   }
@@ -224,6 +231,10 @@ const initDB = async () => {
       quantity REAL NOT NULL,
       unit TEXT DEFAULT 'pcs'
     );
+    CREATE TABLE IF NOT EXISTS app_meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT
+    );
     CREATE TABLE IF NOT EXISTS stock_verifications (
       id SERIAL PRIMARY KEY,
       godown TEXT NOT NULL,
@@ -282,10 +293,31 @@ const initDB = async () => {
   // One-time cleanup: merge any pre-existing duplicate rows for the same
   // (name, godown) -- e.g. Opening Stock and Regular Stock entered before
   // the upsert logic existed -- into a single row, then enforce uniqueness.
-  await mergeDuplicateInventoryRows();
+  // These two are one-time repairs, not startup work. Running them on every
+  // boot cost one query per inventory item before the server accepted traffic.
+  const alreadyRepaired = await pool.query(
+    "SELECT 1 FROM app_meta WHERE key = 'repaired_v1'"
+  ).then(r => r.rowCount > 0).catch(() => false);
+
+  if (!alreadyRepaired) await mergeDuplicateInventoryRows();
   try {
     await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS inventory_name_godown_uniq ON inventory (LOWER(name), godown)');
   } catch (e) { console.error('Could not create uniqueness index, duplicates may remain:', e.message); }
+
+  // The ledger is the only table that grows without bound, and every ledger
+  // read partitions by (name, godown) and orders by created_at.
+  const indexes = [
+    'CREATE INDEX IF NOT EXISTS idx_ledger_item ON stock_ledger (LOWER(name), godown, created_at)',
+    'CREATE INDEX IF NOT EXISTS idx_ledger_created ON stock_ledger (created_at)',
+    'CREATE INDEX IF NOT EXISTS idx_ledger_type ON stock_ledger (movement_type)',
+    'CREATE INDEX IF NOT EXISTS idx_inventory_godown ON inventory (godown)',
+    'CREATE INDEX IF NOT EXISTS idx_sessions_email ON sessions (email)',
+    'CREATE INDEX IF NOT EXISTS idx_verif_lines ON stock_verification_lines (verification_id)',
+  ];
+  for (const sql of indexes) {
+    try { await pool.query(sql); }
+    catch (e) { console.error('Index step failed:', sql.slice(0, 60), '->', e.message); }
+  }
 
   const defaults = ['Godown-1','Godown-2','Godown-3','Godown-4','Godown-5'];
   for (const g of defaults) {
@@ -293,9 +325,30 @@ const initDB = async () => {
   }
 
   // Backfill opening balances into the ledger for pre-existing stock
-  try { await seedLedgerFromInventory(); } catch (e) { console.error('Ledger seed failed:', e.message); }
+  if (!alreadyRepaired) {
+    try {
+      await seedLedgerFromInventory();
+      await pool.query("INSERT INTO app_meta (key, value) VALUES ('repaired_v1', NOW()::text) ON CONFLICT (key) DO NOTHING");
+    } catch (e) { console.error('Ledger seed failed:', e.message); }
+  }
 
-  console.log('Database ready - v2.2');
+  // Historical ledger rows carry a locale-formatted action_date. created_at is
+  // authoritative for them (nothing was back-dated before this existed), so the
+  // text can be rewritten to ISO safely and only once.
+  try {
+    const done = await pool.query("SELECT 1 FROM app_meta WHERE key = 'iso_dates_v1'").then(r => r.rowCount > 0);
+    if (!done) {
+      const { rowCount } = await pool.query(
+        `UPDATE stock_ledger
+         SET action_date = to_char((created_at AT TIME ZONE 'Asia/Kolkata')::date, 'YYYY-MM-DD')
+         WHERE action_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'`
+      );
+      await pool.query("INSERT INTO app_meta (key, value) VALUES ('iso_dates_v1', NOW()::text) ON CONFLICT (key) DO NOTHING");
+      if (rowCount) console.log(`Rewrote ${rowCount} ledger action_date value(s) to ISO`);
+    }
+  } catch (e) { console.error('Date normalisation failed:', e.message); }
+
+  console.log('Database ready - v2.3');
 };
 
 app.use(cors());
@@ -465,7 +518,7 @@ const logLedger = (client, { name, godown, movement_type, quantity, unit, refere
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,
              COALESCE(($10::date + TIME '12:00') AT TIME ZONE 'Asia/Kolkata', NOW()))`,
     [name, godown, movement_type, quantity, unit || 'pcs', reference || '', remarks || '', action_by,
-     action_date || new Date().toLocaleDateString(),
+     action_date || istDate(),
      IST_DATE_RE.test(entry_date || '') ? entry_date : null]
   );
 
@@ -511,7 +564,7 @@ async function upsertInventory(client, item, addedBy) {
   const { rows: inserted } = await client.query(
     `INSERT INTO inventory (${INV_FIELDS}) VALUES (${INV_VALS}) RETURNING *`,
     [name, qty, unit || 'pcs', secQty, secondary_unit || '', godown,
-     dateAdded || new Date().toLocaleDateString(), addedBy,
+     dateAdded || istDate(), addedBy,
      price || 0, hsn || 'N/A', builty_number || '', transporter || '', remarks || '',
      stock_type || 'regular', category || '', stock_type === 'opening' ? qty : 0]
   );
@@ -539,12 +592,31 @@ app.post('/api/inventory', auth, async (req, res) => {
   res.json(row);
 });
 
+// All or nothing: a 60-row import that failed at row 40 used to leave 39 rows
+// written with no way to tell which.
 app.post('/api/inventory/bulk', auth, async (req, res) => {
   const { items } = req.body;
-  for (const item of items) {
-    await upsertInventory(pool, item, req.user.email);
+  if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'No items to import' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let n = 0;
+    for (const item of items) {
+      if (!item || !item.name || !item.godown) {
+        throw new Error(`Row ${n + 1} is missing an item name or godown`);
+      }
+      await upsertInventory(client, item, req.user.email);
+      n++;
+    }
+    await client.query('COMMIT');
+    res.json({ message: `Added ${n} items`, imported: n });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: `Import cancelled, nothing was saved. ${err.message}` });
+  } finally {
+    client.release();
   }
-  res.json({ message: `Added ${items.length} items` });
 });
 
 // Transfer stock between godowns -- atomic decrement at source, merge/credit at destination
@@ -577,7 +649,7 @@ app.post('/api/inventory/transfer', auth, async (req, res) => {
       await client.query('UPDATE inventory SET quantity=$1 WHERE id=$2', [remainingQty, source.id]);
     }
 
-    const dateNow = new Date().toLocaleDateString();
+    const dateNow = istDate();
     const destRow = await upsertInventory(client, {
       name: source.name, quantity: qty, unit: unit || source.unit,
       secondary_quantity: 0, secondary_unit: source.secondary_unit,
@@ -618,7 +690,7 @@ app.post('/api/issue-slips', auth, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const dateNow = new Date().toLocaleDateString();
+    const dateNow = istDate();
 
     // Validate all availabilities first
     for (const it of items) {
@@ -683,7 +755,7 @@ app.delete('/api/issue-slips/:id', auth, async (req, res) => {
     if (slips[0].status === 'cancelled') throw Object.assign(new Error('Slip already cancelled'), { status: 400 });
 
     const { rows: items } = await client.query('SELECT * FROM issue_slip_items WHERE slip_id=$1', [req.params.id]);
-    const dateNow = new Date().toLocaleDateString();
+    const dateNow = istDate();
 
     for (const it of items) {
       // Restore quantity: merge back into existing row or recreate it
@@ -722,8 +794,10 @@ app.get('/api/ledger', auth, async (req, res) => {
   if (name)      { params.push(`%${name.toLowerCase()}%`); conditions.push(`LOWER(sl.name) LIKE $${params.length}`); }
   if (godown)    { params.push(godown);                    conditions.push(`sl.godown = $${params.length}`); }
   if (type)      { params.push(type);                      conditions.push(`sl.movement_type = $${params.length}`); }
-  if (from_date) { params.push(from_date);                 conditions.push(`sl.created_at::date >= $${params.length}::date`); }
-  if (to_date)   { params.push(to_date);                   conditions.push(`sl.created_at::date <= $${params.length}::date`); }
+  // IST, to match /api/daily-receipts. Comparing in UTC put anything recorded
+  // between midnight and 05:30 IST on the previous day.
+  if (from_date) { params.push(from_date); conditions.push(`(sl.created_at AT TIME ZONE 'Asia/Kolkata')::date >= $${params.length}::date`); }
+  if (to_date)   { params.push(to_date);   conditions.push(`(sl.created_at AT TIME ZONE 'Asia/Kolkata')::date <= $${params.length}::date`); }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const { rows } = await pool.query(
     `SELECT sl.*,
@@ -763,7 +837,7 @@ app.put('/api/inventory/:id/issue', auth, async (req, res) => {
   const item = rows[0];
   const newQty = item.quantity - quantity;
   if (newQty < 0) return res.status(400).json({ error: 'Cannot issue more than available' });
-  const dateNow = new Date().toLocaleDateString();
+  const dateNow = istDate();
   await logLedger(pool, { name: item.name, godown: item.godown, movement_type: 'OUT', quantity, unit: item.unit, reference: issued_to || '', remarks: remarks || '', action_by: req.user.email, action_date: dateNow });
   if (newQty === 0) {
     await pool.query('DELETE FROM inventory WHERE id = $1', [item.id]);
@@ -776,9 +850,35 @@ app.put('/api/inventory/:id/issue', auth, async (req, res) => {
   res.json(updated[0]);
 });
 
+// Deleting used to remove the row and leave its IN movements behind, so the
+// item's history said it arrived and was never issued. The stock is now written
+// off through the ledger first, and the row is kept out of the way only after
+// the movement that explains it exists.
 app.delete('/api/inventory/:id', auth, requireAdmin, async (req, res) => {
-  await pool.query('DELETE FROM inventory WHERE id = $1', [req.params.id]);
-  res.json({ message: 'Deleted' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: [item] } = await client.query('SELECT * FROM inventory WHERE id = $1 FOR UPDATE', [req.params.id]);
+    if (!item) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Item not found' }); }
+
+    if (item.quantity && item.quantity !== 0) {
+      await logLedger(client, {
+        name: item.name, godown: item.godown, movement_type: 'ADJUST',
+        quantity: -item.quantity, unit: item.unit,
+        reference: 'ITEM-DELETED',
+        remarks: `Item removed from ${item.godown} by ${req.user.email}${req.body?.reason ? ' -- ' + req.body.reason : ''}`,
+        action_by: req.user.email, action_date: istDate(),
+      });
+    }
+    await client.query('DELETE FROM inventory WHERE id = $1', [req.params.id]);
+    await client.query('COMMIT');
+    res.json({ message: 'Deleted', wrote_off: item.quantity || 0 });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
 // Item name suggestions (autocomplete) â€" searches master list + existing inventory
@@ -927,7 +1027,7 @@ app.post('/api/verification', auth, async (req, res) => {
         reference: `VERIFY-${vdate || 'today'}-${godown}`,
         remarks: `Physical count ${countedQty} vs system ${row.quantity}${note ? ' -- ' + note : ''}`,
         action_by: req.user.email,
-        action_date: vdate || new Date().toLocaleDateString(),
+        action_date: vdate || istDate(),
         entry_date: vdate,
       });
       applied.push({ name: row.name, unit: row.unit, system_qty: row.quantity, counted_qty: countedQty, difference: diff });
@@ -954,7 +1054,7 @@ app.post('/api/verification', auth, async (req, res) => {
             name: known.name, godown, movement_type: 'ADJUST', quantity: diff, unit: known.unit,
             reference: `VERIFY-${vdate || 'today'}-${godown}`,
             remarks: `Physical count ${qty} vs system ${known.quantity}${note ? ' -- ' + note : ''}`,
-            action_by: req.user.email, action_date: vdate || new Date().toLocaleDateString(), entry_date: vdate,
+            action_by: req.user.email, action_date: vdate || istDate(), entry_date: vdate,
           });
           applied.push({ name: known.name, unit: known.unit, system_qty: known.quantity, counted_qty: qty, difference: diff });
         }
@@ -965,7 +1065,7 @@ app.post('/api/verification', auth, async (req, res) => {
       const { rows: [created] } = await client.query(
         `INSERT INTO inventory (name, quantity, unit, godown, date_added, added_by, stock_type)
          VALUES ($1,$2,$3,$4,$5,$6,'regular') RETURNING *`,
-        [name, qty, unit, godown, vdate || new Date().toLocaleDateString(), req.user.email]
+        [name, qty, unit, godown, vdate || istDate(), req.user.email]
       );
       byName.set(name.toLowerCase(), { id: created.id, name: created.name, unit: created.unit, quantity: qty });
 
@@ -974,7 +1074,7 @@ app.post('/api/verification', auth, async (req, res) => {
         name: created.name, godown, movement_type: 'ADJUST', quantity: qty, unit,
         reference: `VERIFY-${vdate || 'today'}-${godown}`,
         remarks: `Found on floor during count, not previously in system${note ? ' -- ' + note : ''}`,
-        action_by: req.user.email, action_date: vdate || new Date().toLocaleDateString(), entry_date: vdate,
+        action_by: req.user.email, action_date: vdate || istDate(), entry_date: vdate,
       });
       applied.push({ name: created.name, unit, system_qty: 0, counted_qty: qty, difference: qty, is_new: true });
     }
@@ -1034,7 +1134,7 @@ No other text.`;
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method:'POST',
       headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01'},
-      body: JSON.stringify({ model:'claude-opus-4-5', max_tokens:1000, messages:[{role:'user',content:messageContent}]})
+      body: JSON.stringify({ model:'claude-opus-5', max_tokens:8000, messages:[{role:'user',content:messageContent}]})
     });
     const data = await response.json();
     if (!response.ok) return res.status(500).json({ error: data.error?.message || 'Claude API error' });

@@ -10,10 +10,12 @@ const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0
 const parseYmd = (s) => { const [y, m, d] = s.split('-'); return new Date(+y, +m - 1, +d); };
 const prettyDay = (s) => parseYmd(s).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
 const shiftYmd = (s, n) => { const d = parseYmd(s); d.setDate(d.getDate() + n); return ymd(d); };
+const showDate = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? prettyDay(v) : (v || '-'));
 
 const InventoryApp = () => {
   const [currentUser, setCurrentUser] = useState(null);
   const [currentRole, setCurrentRole] = useState('staff');
+  const [toasts, setToasts] = useState([]);
   const isAdmin = currentRole === 'admin';
   const [token, setToken] = useState(null);
   const [email, setEmail] = useState('');
@@ -131,6 +133,18 @@ const InventoryApp = () => {
 
   const authHeaders = useCallback(() => ({ 'Content-Type': 'application/json', 'Authorization': token }), [token]);
 
+  // Replaces the blocking browser dialogs -- these are non-blocking, styled, and
+  // legible on a phone. Errors stay until dismissed; everything else clears itself.
+  const notify = useCallback((message, kind = 'info') => {
+    const id = Date.now() + Math.random();
+    setToasts(t => [...t, { id, message: String(message), kind }]);
+    if (kind !== 'error') {
+      setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), kind === 'success' ? 3500 : 5000);
+    }
+  }, []);
+
+  const dismissToast = (id) => setToasts(t => t.filter(x => x.id !== id));
+
   // Sessions expire now, so a 401 has to sign the user out rather than quietly
   // rendering an empty warehouse.
   const signOutLocal = (msg) => {
@@ -230,14 +244,14 @@ const InventoryApp = () => {
   const addFoundItem = () => {
     const name = vnName.trim();
     const qty = parseFloat(vnQty);
-    if (!name) { alert('Enter the item name'); return; }
-    if (!isFinite(qty) || qty <= 0) { alert('Enter a quantity greater than zero'); return; }
+    if (!name) { notify('Enter the item name', 'error'); return; }
+    if (!isFinite(qty) || qty <= 0) { notify('Enter a quantity greater than zero', 'error'); return; }
     if (vSheet.some(r => r.name.toLowerCase() === name.toLowerCase())) {
-      alert(`"${name}" is already on the count sheet below — type its figure in the Counted box instead.`);
+      notify(`"${name}" is already on the count sheet below — type its figure in the Counted box instead.`, 'error');
       return;
     }
     if (vNewItems.some(r => r.name.toLowerCase() === name.toLowerCase())) {
-      alert(`"${name}" has already been added.`); return;
+      notify(`"${name}" has already been added.`, 'error'); return;
     }
     setVNewItems([...vNewItems, { name, counted: String(qty), unit: vnUnit }]);
     setVnName(''); setVnQty('');
@@ -245,8 +259,8 @@ const InventoryApp = () => {
 
   const saveVerification = async () => {
     const stats = verifyStats();
-    if (!vGodown) { alert('Select a godown'); return; }
-    if (!stats.counted) { alert('Nothing counted yet -- type at least one figure.'); return; }
+    if (!vGodown) { notify('Select a godown', 'error'); return; }
+    if (!stats.counted) { notify('Nothing counted yet — type at least one figure.', 'error'); return; }
     const changing = stats.short + stats.excess;
     const foundLine = stats.found ? `\n${stats.found} new item(s) will be created in ${vGodown}.` : '';
     const msg = vFullCount
@@ -262,13 +276,13 @@ const InventoryApp = () => {
     });
     const data = await res.json();
     setVSaving(false);
-    if (!res.ok) { alert('Failed: ' + (data.error || 'unknown error')); return; }
+    if (!res.ok) { notify('Failed: ' + (data.error || 'unknown error'), 'error'); return; }
     await loadInventory();
     await loadVerifyHistory();
     await loadVerifySheet(vGodown);
     setVNewItems([]);
     setVNote('');
-    alert(`Verification saved.\n\n${data.items_counted} counted, ${data.items_adjusted} corrected, net change ${data.net_change > 0 ? '+' : ''}${data.net_change}.`);
+    notify(`Verification saved — ${data.items_counted} counted, ${data.items_adjusted} corrected, net change ${data.net_change > 0 ? '+' : ''}${data.net_change}.`, 'success');
   };
 
   // Accordion: opening one tool panel closes the others so they don't stack
@@ -380,7 +394,7 @@ const InventoryApp = () => {
     const res = await fetch(`${API}/signup`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email,password}) });
     const data = await res.json();
     if (!res.ok) { setAuthError(data.error); return; }
-    alert('Account created! Now sign in.'); setIsLogin(true); setEmail(''); setPassword('');
+    notify('Account created. Now sign in.', 'success'); setIsLogin(true); setEmail(''); setPassword('');
   };
 
   const handleLogout = async () => {
@@ -394,7 +408,7 @@ const InventoryApp = () => {
     if (!newItem || !newQty || !newGodown) return;
     await fetch(`${API}/inventory`, {
       method:'POST', headers: authHeaders(),
-      body: JSON.stringify({ name:newItem, quantity:parseFloat(newQty), unit:newUnit, secondary_quantity:parseFloat(newSecQty)||0, secondary_unit:newSecUnit, conversion:parseFloat(newConv)||0, godown:newGodown, dateAdded:new Date().toLocaleDateString(), builty_number:newBuilty, transporter:newTransporter, remarks:newRemarks, stock_type:newStockType, category:newCategory })
+      body: JSON.stringify({ name:newItem, quantity:parseFloat(newQty), unit:newUnit, secondary_quantity:parseFloat(newSecQty)||0, secondary_unit:newSecUnit, conversion:parseFloat(newConv)||0, godown:newGodown, dateAdded:istToday(), builty_number:newBuilty, transporter:newTransporter, remarks:newRemarks, stock_type:newStockType, category:newCategory })
     });
     await loadInventory(); await loadCategories();
     setNewItem(''); setNewQty(''); setNewSecQty(''); setNewConv(''); setNewBuilty(''); setNewTransporter(''); setNewRemarks(''); setNewCategory('');
@@ -411,7 +425,7 @@ const InventoryApp = () => {
     if (!drItem || !drQty || !drGodown) { setDrMsg('❌ Item, quantity and godown are required'); return; }
     const res = await fetch(`${API}/inventory`, {
       method: 'POST', headers: authHeaders(),
-      body: JSON.stringify({ name: drItem, quantity: parseFloat(drQty), unit: drUnit, godown: drGodown, dateAdded: parseYmd(dailyDate).toLocaleDateString(), entry_date: dailyDate, remarks: drRemarks, stock_type: 'regular' })
+      body: JSON.stringify({ name: drItem, quantity: parseFloat(drQty), unit: drUnit, godown: drGodown, dateAdded: dailyDate, entry_date: dailyDate, remarks: drRemarks, stock_type: 'regular' })
     });
     if (!res.ok) { const d = await res.json(); setDrMsg('❌ ' + (d.error || 'Failed')); return; }
     await loadInventory(); await loadDailyReceipts();
@@ -467,7 +481,7 @@ const InventoryApp = () => {
 
   const shareDailyWhatsApp = async () => {
     const list = dailyReceipts;
-    if (!list.length) { alert(`Nothing recorded on ${prettyDay(dailyDate)} to share.`); return; }
+    if (!list.length) { notify(`Nothing recorded on ${prettyDay(dailyDate)} to share.`, 'error'); return; }
     const dateStr = prettyDay(dailyDate);
     // Split into pages of DAILY_PER_PAGE so each image fits a phone screen
     const pages = [];
@@ -490,7 +504,7 @@ const InventoryApp = () => {
     if (!qty || qty <= 0) return;
     const res = await fetch(`${API}/inventory/${id}/issue`, { method:'PUT', headers: authHeaders(), body: JSON.stringify({ quantity: qty }) });
     const data = await res.json();
-    if (!res.ok) { alert(data.error); return; }
+    if (!res.ok) { notify(data.error, 'error'); return; }
     await loadInventory();
   };
 
@@ -510,8 +524,8 @@ const InventoryApp = () => {
 
   const submitIssueSlip = async () => {
     const invalid = slipItems.filter(s => !s.issueQty || parseFloat(s.issueQty) <= 0 || parseFloat(s.issueQty) > s.available);
-    if (invalid.length) { alert(`Check quantities — ${invalid.length} item(s) have invalid or excess quantities.`); return; }
-    if (!slipItems.length) { alert('Add at least one item to the slip.'); return; }
+    if (invalid.length) { notify(`Check quantities — ${invalid.length} item(s) have invalid or excess quantities.`, 'error'); return; }
+    if (!slipItems.length) { notify('Add at least one item to the slip.', 'error'); return; }
     const res = await fetch(`${API}/issue-slips`, {
       method: 'POST', headers: authHeaders(),
       body: JSON.stringify({
@@ -520,7 +534,7 @@ const InventoryApp = () => {
       })
     });
     const data = await res.json();
-    if (!res.ok) { alert(data.error); return; }
+    if (!res.ok) { notify(data.error, 'error'); return; }
     await loadInventory(); await loadRecentSlips();
     setIssueSuccess(`✅ ${data.message}`);
     setTimeout(() => setIssueSuccess(''), 4000);
@@ -537,7 +551,7 @@ const InventoryApp = () => {
     if (!window.confirm(`Cancel Slip #${id}? All its quantities will be added back to stock.`)) return;
     const res = await fetch(`${API}/issue-slips/${id}`, { method: 'DELETE', headers: authHeaders() });
     const data = await res.json();
-    if (!res.ok) { alert(data.error); return; }
+    if (!res.ok) { notify(data.error, 'error'); return; }
     await loadInventory(); await loadRecentSlips();
     setIssueSuccess(`✅ ${data.message}`);
     setTimeout(() => setIssueSuccess(''), 4000);
@@ -670,13 +684,13 @@ const InventoryApp = () => {
   };
 
   const confirmImport = async () => {
-    if (!importGodown) { alert('Please select a godown'); return; }
+    if (!importGodown) { notify('Please select a godown', 'error'); return; }
     const items = importPreview.map(row => ({ ...row, godown: importGodown, dateAdded: importDate, entry_date: importDate, stock_type: 'regular' }));
     const res = await fetch(`${API}/inventory/bulk`, { method:'POST', headers: authHeaders(), body: JSON.stringify({ items }) });
     if (res.ok) {
       await loadInventory();
       setImportPreview([]); setImportFile(null); setShowImport(false);
-      alert(`✅ Imported ${items.length} items successfully!`);
+      notify(`Imported ${items.length} item(s).`, 'success');
     }
   };
 
@@ -717,18 +731,22 @@ const InventoryApp = () => {
 
   const addExtractedItems = async () => {
     const missing = extractedData.filter(i => !i.godown);
-    if (missing.length) { alert(`Select godown for all items (${missing.length} missing)`); return; }
+    if (missing.length) { notify(`Select a godown for all items — ${missing.length} still missing.`, 'error'); return; }
     await fetch(`${API}/inventory/bulk`, { method:'POST', headers: authHeaders(), body: JSON.stringify({ items: extractedData.map(i => ({ name:i.name, quantity:i.quantity, unit:i.unit||'pcs', godown:i.godown, dateAdded:i.stockEntryDate, price:i.price||0, hsn:i.hsn||'N/A', remarks:i.remarks||'' }))}) });
     await loadInventory();
     setExtractedData([]); setUploadFile(null); setShowUpload(false);
-    alert(`Added ${extractedData.length} items!`);
+    notify(`Added ${extractedData.length} item(s).`, 'success');
   };
 
-  const exportCSV = () => {
+  // Exports what is on screen. It used to dump the whole table regardless of the
+  // search box and category filter, which is not what "Export" reads as.
+  const exportCSV = (rows) => {
+    const list = Array.isArray(rows) ? rows : inventory;
+    if (!list.length) { notify('Nothing to export with the current filters.', 'error'); return; }
     const csv = [
       ['Item','Quantity','Unit','Sec Qty','Sec Unit','Godown','Date','Added By','Builty','Transporter','Remarks','Type'],
-      ...inventory.map(i => [i.name,i.quantity,i.unit||'',i.secondary_quantity||'',i.secondary_unit||'',i.godown,i.date_added,i.added_by,i.builty_number||'',i.transporter||'',i.remarks||'',i.stock_type||''])
-    ].map(r => r.map(v => `"${v}"`).join(',')).join('\n');
+      ...list.map(i => [i.name,i.quantity,i.unit||'',i.secondary_quantity||'',i.secondary_unit||'',i.godown,i.date_added,i.added_by,i.builty_number||'',i.transporter||'',i.remarks||'',i.stock_type||''])
+    ].map(r => r.map(v => `"${String(v ?? '').replace(/"/g,'""')}"`).join(',')).join('\n');
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([csv], {type:'text/csv'}));
     a.download = `inventory_${new Date().toISOString().split('T')[0]}.csv`;
@@ -819,6 +837,29 @@ const InventoryApp = () => {
 
   return (
     <div>
+      {/* Toasts */}
+      {toasts.length > 0 && (
+        <div style={{position:'fixed',top:14,right:14,zIndex:9999,display:'flex',flexDirection:'column',gap:8,
+          maxWidth:'min(380px, calc(100vw - 28px))'}}>
+          {toasts.map(t => {
+            const skin = t.kind === 'error'   ? {bg:'#fef2f2',bd:'#fecaca',fg:'#991b1b',icon:'⚠'}
+                       : t.kind === 'success' ? {bg:'#f0fdf4',bd:'#86efac',fg:'#166534',icon:'✓'}
+                       :                        {bg:'#eef2ff',bd:'#c7d2fe',fg:'#3730a3',icon:'ℹ'};
+            return (
+              <div key={t.id} onClick={()=>dismissToast(t.id)} role="status"
+                style={{display:'flex',alignItems:'flex-start',gap:9,cursor:'pointer',
+                  background:skin.bg,border:`1px solid ${skin.bd}`,color:skin.fg,
+                  padding:'11px 13px',borderRadius:10,fontSize:13,fontWeight:600,lineHeight:1.45,
+                  boxShadow:'0 6px 18px rgba(15,23,42,.13)',whiteSpace:'pre-line'}}>
+                <span style={{flexShrink:0}}>{skin.icon}</span>
+                <span style={{flex:1}}>{t.message}</span>
+                <span style={{flexShrink:0,opacity:.5,fontWeight:700}}>×</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {/* Header */}
       <div className="header">
         <div className="brand">
@@ -1486,7 +1527,7 @@ const InventoryApp = () => {
                       const tc = typeColors[row.movement_type] || {bg:'#f1f5f9',color:'#475569'};
                       return (
                         <tr key={row.id}>
-                          <td style={{color:'#94a3b8',fontSize:12,whiteSpace:'nowrap'}}>{row.action_date}</td>
+                          <td style={{color:'#94a3b8',fontSize:12,whiteSpace:'nowrap'}}>{showDate(row.action_date)}</td>
                           <td style={{fontWeight:600}}>{row.name}</td>
                           <td style={{color:'#475569'}}>{row.godown}</td>
                           <td><span style={{background:tc.bg,color:tc.color,padding:'2px 8px',borderRadius:20,fontSize:11,fontWeight:700,whiteSpace:'nowrap'}}>{row.movement_type}</span></td>
@@ -1761,7 +1802,7 @@ const InventoryApp = () => {
 
               <div style={{display:'flex',gap:10}}>
                 <button className="btn btn-green" type="submit" style={{flex:1,justifyContent:'center'}}>➕ Add Item</button>
-                <button className="btn btn-purple" type="button" onClick={exportCSV}>📥 Export CSV</button>
+                <button className="btn btn-purple" type="button" onClick={()=>exportCSV(filtered)}>📥 Export CSV{filtered.length !== inventory.length ? ` (${filtered.length})` : ''}</button>
               </div>
             </form>
           )}
@@ -1832,7 +1873,7 @@ const InventoryApp = () => {
                     <td style={{color:'#64748b',fontSize:12}}>{item.builty_number||'-'}</td>
                     <td style={{color:'#64748b',fontSize:12}}>{item.transporter||'-'}</td>
                     <td style={{color:'#64748b',fontSize:12,maxWidth:120,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{item.remarks||'-'}</td>
-                    <td style={{color:'#94a3b8',fontSize:12}}>{item.date_added}</td>
+                    <td style={{color:'#94a3b8',fontSize:12,whiteSpace:'nowrap'}}>{showDate(item.date_added)}</td>
                     <td>
                       {item.stock_type==='opening'
                         ? <span style={{background:'#fef3c7',color:'#92400e',padding:'2px 8px',borderRadius:20,fontSize:11,fontWeight:600}}>Opening</span>
