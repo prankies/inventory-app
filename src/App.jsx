@@ -109,6 +109,9 @@ const InventoryApp = () => {
   const [drAction, setDrAction] = useState(null);
   const [drBusy, setDrBusy] = useState(false);
   const [drBatch, setDrBatch] = useState(null);   // {reason, blocked?} while voiding a whole day
+  // Same correction flow, but for any row in the ledger rather than a receipt.
+  const [lgAction, setLgAction] = useState(null);
+  const [lgBusy, setLgBusy] = useState(false);
 
   // Stock Ledger
   const [showLedger, setShowLedger] = useState(false);
@@ -482,6 +485,62 @@ const InventoryApp = () => {
     notify(data.stock_changed
       ? `Entry voided and ${data.quantity} taken back out of stock.`
       : 'Entry voided. Stock left at the counted figure.', 'success');
+  };
+
+  const startLedgerEdit = (r) => setLgAction({ id: r.id, mode: 'edit', qty: String(r.quantity), remarks: r.remarks || '' });
+  const startLedgerVoid = (r) => setLgAction({ id: r.id, mode: 'void', reason: '' });
+  const cancelLedger = () => setLgAction(null);
+
+  const afterLedgerChange = async (msg) => {
+    setLgAction(null);
+    await loadInventory(); await loadLedger();
+    if (showDaily) await loadDailyReceipts();
+    notify(msg, 'success');
+  };
+
+  const saveLedgerEdit = async () => {
+    const qty = parseFloat(lgAction.qty);
+    if (!isFinite(qty) || qty <= 0) { notify('Quantity must be greater than zero', 'error'); return; }
+    setLgBusy(true);
+    const res = await fetch(`${API}/movements/${lgAction.id}`, {
+      method: 'PUT', headers: authHeaders(),
+      body: JSON.stringify({ quantity: qty, remarks: lgAction.remarks }),
+    });
+    const data = await res.json();
+    setLgBusy(false);
+    if (!res.ok) {
+      if (data.code === 'BELOW_ZERO') { setLgAction({ ...lgAction, blocked: data }); return; }
+      notify(data.error || 'Could not save the correction', 'error');
+      return;
+    }
+    await afterLedgerChange('Entry corrected. Stock adjusted by the difference.');
+  };
+
+  const voidLedgerRow = async (opts = {}) => {
+    setLgBusy(true);
+    const res = await fetch(`${API}/movements/${lgAction.id}/void`, {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({
+        reason: lgAction.reason,
+        stock_effect: opts.stockEffect || 'reverse',
+        allow_unpaired: !!opts.allowUnpaired,
+      }),
+    });
+    const data = await res.json();
+    setLgBusy(false);
+    if (!res.ok) {
+      if (data.code === 'BELOW_ZERO' || data.code === 'UNPAIRED_TRANSFER') {
+        setLgAction({ ...lgAction, blocked: data });
+        return;
+      }
+      notify(data.error || 'Could not void the entry', 'error');
+      return;
+    }
+    await afterLedgerChange(data.legs > 1
+      ? 'Transfer voided on both sides and stock put back.'
+      : data.stock_changed
+        ? `Entry voided and ${data.quantity} put back.`
+        : 'Entry voided. Stock left as it was.');
   };
 
   const voidWholeDay = async (stockEffect) => {
@@ -1709,6 +1768,7 @@ const InventoryApp = () => {
                       <th style={{textAlign:'right'}}>Qty</th><th>Unit</th>
                       <th style={{textAlign:'right'}}>Balance</th>
                       <th>Reference</th><th>Remarks</th><th>By</th>
+                      <th style={{textAlign:'right'}}>Fix</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1729,7 +1789,8 @@ const InventoryApp = () => {
                       };
                       const tc = typeColors[row.movement_type] || {bg:'#f1f5f9',color:'#475569'};
                       return (
-                        <tr key={row.id} style={isVoid ? {opacity:.55} : undefined}>
+                        <React.Fragment key={row.id}>
+                        <tr style={isVoid ? {opacity:.55} : undefined}>
                           <td style={{color:'#94a3b8',fontSize:12,whiteSpace:'nowrap'}}>{showDate(row.action_date)}</td>
                           <td style={{fontWeight:600,textDecoration:isVoid?'line-through':'none'}}>{row.name}
                             {isVoid && <span title={row.void_reason || 'voided'} style={{marginLeft:6,background:'#fee2e2',color:'#991b1b',padding:'1px 7px',borderRadius:20,fontSize:10,fontWeight:700,textDecoration:'none',display:'inline-block'}}>VOID</span>}</td>
@@ -1741,7 +1802,76 @@ const InventoryApp = () => {
                           <td style={{color:'#64748b',fontSize:12}}>{row.reference || '-'}</td>
                           <td style={{color:'#64748b',fontSize:12,maxWidth:120,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{row.remarks || '-'}</td>
                           <td style={{color:'#94a3b8',fontSize:11}}>{row.action_by}</td>
+                          <td style={{textAlign:'right',whiteSpace:'nowrap'}}>
+                            {isVoid || row.reference === 'SYSTEM-SEED' ? null : (
+                              <>
+                                <button className="btn btn-light btn-sm" title="Correct the quantity"
+                                  onClick={()=>startLedgerEdit(row)}>&#9998;</button>{' '}
+                                <button className="btn btn-red btn-sm" title="Void this entry"
+                                  onClick={()=>startLedgerVoid(row)}>&#128465;</button>
+                              </>
+                            )}
+                          </td>
                         </tr>
+                        {lgAction && lgAction.id === row.id && (
+                          <tr>
+                            <td colSpan={11} style={{background: lgAction.mode === 'void' ? '#fef2f2' : '#f8fafc', borderTop:'none'}}>
+                              {lgAction.blocked ? (
+                                <div style={{padding:'6px 0'}}>
+                                  <div style={{color:'#b45309',fontWeight:700,fontSize:13,marginBottom:5}}>
+                                    {lgAction.blocked.code === 'UNPAIRED_TRANSFER' ? 'Other half of the transfer not found' : 'Not enough stock to reverse this'}
+                                  </div>
+                                  <div style={{color:'#7c2d12',fontSize:12.5,marginBottom:9,lineHeight:1.5,maxWidth:720}}>
+                                    {lgAction.blocked.error}
+                                  </div>
+                                  <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+                                    {lgAction.blocked.code === 'UNPAIRED_TRANSFER' ? (
+                                      <button className="btn btn-red btn-sm" disabled={lgBusy}
+                                        onClick={()=>voidLedgerRow({ allowUnpaired: true })}>
+                                        {lgBusy ? 'Voiding...' : 'Void this side only'}
+                                      </button>
+                                    ) : (
+                                      <button className="btn btn-red btn-sm" disabled={lgBusy}
+                                        onClick={()=>voidLedgerRow({ stockEffect: 'record_only' })}>
+                                        {lgBusy ? 'Voiding...' : `Void the record, leave stock at ${lgAction.blocked.available}`}
+                                      </button>
+                                    )}
+                                    <button className="btn btn-light btn-sm" disabled={lgBusy} onClick={cancelLedger}>Leave it alone</button>
+                                  </div>
+                                </div>
+                              ) : lgAction.mode === 'void' ? (
+                                <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',padding:'4px 0'}}>
+                                  <span style={{color:'#991b1b',fontWeight:700,fontSize:13}}>
+                                    Void this {row.movement_type} of {row.quantity} {row.unit} — {row.name} in {row.godown}?
+                                  </span>
+                                  <input className="input" style={{marginBottom:0,flex:'1 1 170px',padding:'5px 9px'}}
+                                    placeholder="Reason (optional)" autoFocus value={lgAction.reason}
+                                    onChange={e=>setLgAction({...lgAction, reason:e.target.value})}
+                                    onKeyDown={e=>{ if(e.key==='Enter') voidLedgerRow(); if(e.key==='Escape') cancelLedger(); }} />
+                                  <button className="btn btn-red btn-sm" disabled={lgBusy} onClick={()=>voidLedgerRow()}>
+                                    {lgBusy ? 'Voiding...' : 'Void it'}
+                                  </button>
+                                  <button className="btn btn-light btn-sm" disabled={lgBusy} onClick={cancelLedger}>Cancel</button>
+                                </div>
+                              ) : (
+                                <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',padding:'4px 0'}}>
+                                  <span style={{fontWeight:700,fontSize:13,color:'#334155'}}>Correct {row.name} in {row.godown}:</span>
+                                  <input className="input" type="number" step="any" min="0" autoFocus
+                                    style={{marginBottom:0,width:110,textAlign:'right',padding:'5px 8px'}}
+                                    value={lgAction.qty} onChange={e=>setLgAction({...lgAction, qty:e.target.value})}
+                                    onKeyDown={e=>{ if(e.key==='Enter') saveLedgerEdit(); if(e.key==='Escape') cancelLedger(); }} />
+                                  <input className="input" style={{marginBottom:0,flex:'1 1 160px',padding:'5px 9px'}}
+                                    placeholder="Remarks" value={lgAction.remarks}
+                                    onChange={e=>setLgAction({...lgAction, remarks:e.target.value})}
+                                    onKeyDown={e=>{ if(e.key==='Enter') saveLedgerEdit(); if(e.key==='Escape') cancelLedger(); }} />
+                                  <button className="btn btn-green btn-sm" disabled={lgBusy} onClick={saveLedgerEdit}>Save</button>
+                                  <button className="btn btn-light btn-sm" disabled={lgBusy} onClick={cancelLedger}>Cancel</button>
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        )}
+                        </React.Fragment>
                       );
                     })}
                   </tbody>

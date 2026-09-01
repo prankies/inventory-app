@@ -283,6 +283,10 @@ const initDB = async () => {
     "ALTER TABLE stock_ledger ADD COLUMN IF NOT EXISTS void_reason TEXT",
     "ALTER TABLE stock_ledger ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ",
     "ALTER TABLE stock_ledger ADD COLUMN IF NOT EXISTS edit_note TEXT",
+    // A transfer is two rows -- one out, one in. They share a pair_id so that
+    // voiding either one always voids both and the two godowns stay in step.
+    "ALTER TABLE stock_ledger ADD COLUMN IF NOT EXISTS pair_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_ledger_pair ON stock_ledger (pair_id)",
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ",
     `UPDATE sessions SET expires_at = NOW() + INTERVAL '${SESSION_DAYS} days' WHERE expires_at IS NULL`,
@@ -521,13 +525,13 @@ const INV_VALS  = `$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16`;
 // the day the stock actually arrived rather than the day it was typed in.
 const IST_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-const logLedger = (client, { name, godown, movement_type, quantity, unit, reference, remarks, action_by, action_date, entry_date }) =>
+const logLedger = (client, { name, godown, movement_type, quantity, unit, reference, remarks, action_by, action_date, entry_date, pair_id }) =>
   client.query(
-    `INSERT INTO stock_ledger (name, godown, movement_type, quantity, unit, reference, remarks, action_by, action_date, created_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,
-             COALESCE(($10::date + TIME '12:00') AT TIME ZONE 'Asia/Kolkata', NOW()))`,
+    `INSERT INTO stock_ledger (name, godown, movement_type, quantity, unit, reference, remarks, action_by, action_date, pair_id, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+             COALESCE(($11::date + TIME '12:00') AT TIME ZONE 'Asia/Kolkata', NOW()))`,
     [name, godown, movement_type, quantity, unit || 'pcs', reference || '', remarks || '', action_by,
-     action_date || istDate(),
+     action_date || istDate(), pair_id || null,
      IST_DATE_RE.test(entry_date || '') ? entry_date : null]
   );
 
@@ -672,8 +676,9 @@ app.post('/api/inventory/transfer', auth, async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [source.name, fromGodown, toGodown, qty, source.unit, remarks || '', req.user.email, dateNow]
     );
-    await logLedger(client, { name: source.name, godown: fromGodown, movement_type: 'TRANSFER-OUT', quantity: qty, unit: source.unit, reference: toGodown, remarks: remarks || '', action_by: req.user.email, action_date: dateNow });
-    await logLedger(client, { name: source.name, godown: toGodown, movement_type: 'TRANSFER-IN', quantity: qty, unit: source.unit, reference: fromGodown, remarks: remarks || '', action_by: req.user.email, action_date: dateNow });
+    const pairId = crypto.randomBytes(8).toString('hex');
+    await logLedger(client, { name: source.name, godown: fromGodown, movement_type: 'TRANSFER-OUT', quantity: qty, unit: source.unit, reference: toGodown, remarks: remarks || '', action_by: req.user.email, action_date: dateNow, pair_id: pairId });
+    await logLedger(client, { name: source.name, godown: toGodown, movement_type: 'TRANSFER-IN', quantity: qty, unit: source.unit, reference: fromGodown, remarks: remarks || '', action_by: req.user.email, action_date: dateNow, pair_id: pairId });
 
     await client.query('COMMIT');
     res.json({ message: `Transferred ${qty} ${source.unit} of ${source.name} from ${fromGodown} to ${toGodown}`, destination: destRow });
@@ -793,6 +798,7 @@ app.delete('/api/issue-slips/:id', auth, async (req, res) => {
 // Stock Ledger -- filterable IN/OUT log with running balance per item+godown
 app.get('/api/ledger', auth, async (req, res) => {
   const { name, godown, type, from_date, to_date } = req.query;
+  // NOTE: rows already include voided / voided_by / void_reason via sl.*
   const conditions = [];
   const params = [];
   if (name)      { params.push(`%${name.toLowerCase()}%`); conditions.push(`LOWER(sl.name) LIKE $${params.length}`); }
@@ -886,6 +892,32 @@ const applyStockDelta = async (client, row, delta) => {
   await client.query('UPDATE inventory SET quantity = $1 WHERE id = $2', [next, inv.id]);
 };
 
+// The other leg of a transfer. New transfers share a pair_id; older ones are
+// matched on the shape they were written with -- same item and quantity, the
+// opposite direction, the two godowns swapped, within a few seconds.
+const findTransferSibling = async (client, row) => {
+  if (row.pair_id) {
+    const { rows } = await client.query(
+      `SELECT * FROM stock_ledger
+       WHERE pair_id = $1 AND id <> $2 AND COALESCE(voided, FALSE) = FALSE FOR UPDATE`,
+      [row.pair_id, row.id]);
+    return rows[0] || null;
+  }
+  const other = row.movement_type === 'TRANSFER-OUT' ? 'TRANSFER-IN' : 'TRANSFER-OUT';
+  const { rows } = await client.query(
+    `SELECT * FROM stock_ledger
+     WHERE movement_type = $1 AND LOWER(name) = LOWER($2) AND quantity = $3
+       AND godown = $4 AND reference = $5
+       AND COALESCE(voided, FALSE) = FALSE
+       AND ABS(EXTRACT(EPOCH FROM (created_at - $6::timestamptz))) < 5
+     ORDER BY ABS(EXTRACT(EPOCH FROM (created_at - $6::timestamptz)))
+     LIMIT 1 FOR UPDATE`,
+    [other, row.name, row.quantity, row.reference, row.godown, row.created_at]);
+  return rows[0] || null;
+};
+
+const TRANSFER_TYPES = ['TRANSFER-IN', 'TRANSFER-OUT'];
+
 app.put('/api/movements/:id', auth, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -893,6 +925,11 @@ app.put('/api/movements/:id', auth, async (req, res) => {
     const { row, error, status } = await loadCorrectableMovement(client, req.params.id, req.user);
     if (error) { await client.query('ROLLBACK'); return res.status(status).json({ error }); }
 
+    if (TRANSFER_TYPES.includes(row.movement_type)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'A transfer is two linked entries. Void it and make the transfer again with the right quantity.' });
+    }
     const qty = req.body.quantity === undefined ? row.quantity : parseFloat(req.body.quantity);
     if (!isFinite(qty) || qty <= 0) {
       await client.query('ROLLBACK');
@@ -933,23 +970,44 @@ app.post('/api/movements/:id/void', auth, async (req, res) => {
     if (error) { await client.query('ROLLBACK'); return res.status(status).json({ error }); }
 
     const recordOnly = req.body?.stock_effect === 'record_only';
-    if (!recordOnly) await applyStockDelta(client, row, -row.quantity);
-
     const reason = (req.body?.reason || '').trim();
-    await client.query(
-      `UPDATE stock_ledger
-       SET voided = TRUE, voided_by = $1, voided_at = NOW(), void_reason = $2
-       WHERE id = $3`,
-      [req.user.email,
-       recordOnly
-         ? `[record only, stock left at counted figure] ${reason}`.trim()
-         : (reason || null),
-       row.id]
-    );
+
+    // A transfer moved stock between two godowns, so both godowns have to be
+    // put back. Voiding one leg alone would invent or destroy stock.
+    const targets = [row];
+    if (TRANSFER_TYPES.includes(row.movement_type)) {
+      const sibling = await findTransferSibling(client, row);
+      if (sibling) targets.push(sibling);
+      else if (!req.body?.allow_unpaired) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          code: 'UNPAIRED_TRANSFER',
+          error: 'The other half of this transfer could not be found, so voiding only this side would ' +
+                 'leave the two godowns out of step. Void it anyway only if you know the other side is already gone.',
+        });
+      }
+    }
+
+    if (!recordOnly) {
+      for (const t of targets) await applyStockDelta(client, t, -t.quantity);
+    }
+
+    const voidNote = recordOnly
+      ? `[record only, stock left at counted figure] ${reason}`.trim()
+      : (reason || null);
+    for (const t of targets) {
+      await client.query(
+        `UPDATE stock_ledger
+         SET voided = TRUE, voided_by = $1, voided_at = NOW(), void_reason = $2
+         WHERE id = $3`,
+        [req.user.email, voidNote, t.id]);
+    }
+
     await client.query('COMMIT');
     res.json({
-      message: recordOnly ? 'Entry voided, stock left as it was' : 'Entry voided',
-      id: row.id, quantity: row.quantity, stock_changed: !recordOnly,
+      message: recordOnly ? 'Entry voided, stock left as it was'
+             : targets.length > 1 ? 'Transfer voided on both sides' : 'Entry voided',
+      id: row.id, quantity: row.quantity, stock_changed: !recordOnly, legs: targets.length,
     });
   } catch (err) {
     await client.query('ROLLBACK');
