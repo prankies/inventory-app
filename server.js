@@ -130,7 +130,8 @@ const seedLedgerFromInventory = async () => {
     const { rows: [agg] } = await pool.query(
       `SELECT
          COUNT(*) FILTER (WHERE reference = 'SYSTEM-SEED') AS seed_count,
-         COALESCE(SUM(CASE WHEN movement_type = 'ADJUST' THEN quantity
+         COALESCE(SUM(CASE WHEN voided THEN 0
+                           WHEN movement_type = 'ADJUST' THEN quantity
                            WHEN movement_type IN ('IN','OPENING','TRANSFER-IN') THEN quantity
                            ELSE -quantity END), 0) AS net
        FROM stock_ledger WHERE LOWER(name)=LOWER($1) AND godown=$2`,
@@ -274,6 +275,14 @@ const initDB = async () => {
     "ALTER TABLE master_items ADD COLUMN IF NOT EXISTS conversion REAL DEFAULT 0",
     // Sessions now expire. Existing tokens are given a full term rather than
     // being cut off, so nobody is signed out by the upgrade itself.
+    // A wrong movement is voided, never erased: the row stays visible with who
+    // voided it and why, and stops counting towards stock.
+    "ALTER TABLE stock_ledger ADD COLUMN IF NOT EXISTS voided BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE stock_ledger ADD COLUMN IF NOT EXISTS voided_by TEXT",
+    "ALTER TABLE stock_ledger ADD COLUMN IF NOT EXISTS voided_at TIMESTAMPTZ",
+    "ALTER TABLE stock_ledger ADD COLUMN IF NOT EXISTS void_reason TEXT",
+    "ALTER TABLE stock_ledger ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ",
+    "ALTER TABLE stock_ledger ADD COLUMN IF NOT EXISTS edit_note TEXT",
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ",
     `UPDATE sessions SET expires_at = NOW() + INTERVAL '${SESSION_DAYS} days' WHERE expires_at IS NULL`,
@@ -801,7 +810,8 @@ app.get('/api/ledger', auth, async (req, res) => {
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const { rows } = await pool.query(
     `SELECT sl.*,
-       SUM(CASE WHEN sl.movement_type = 'ADJUST' THEN sl.quantity
+       SUM(CASE WHEN sl.voided THEN 0
+                WHEN sl.movement_type = 'ADJUST' THEN sl.quantity
                 WHEN sl.movement_type IN ('IN','OPENING','TRANSFER-IN') THEN sl.quantity
                 ELSE -sl.quantity END)
        OVER (PARTITION BY LOWER(sl.name), sl.godown ORDER BY sl.created_at, sl.id) AS running_balance
@@ -818,16 +828,112 @@ app.get('/api/ledger', auth, async (req, res) => {
 app.get('/api/daily-receipts', auth, async (req, res) => {
   const date = req.query.date; // YYYY-MM-DD in IST; defaults to today
   const { rows } = await pool.query(
-    `SELECT name, godown, quantity, unit, reference, remarks, action_by, created_at
+    `SELECT id, name, godown, quantity, unit, reference, remarks, action_by, created_at, edited_at
      FROM stock_ledger
      WHERE movement_type = 'IN'
        AND reference <> 'SYSTEM-SEED'
+       AND COALESCE(voided, FALSE) = FALSE
        AND (created_at AT TIME ZONE 'Asia/Kolkata')::date
            = COALESCE($1::date, (NOW() AT TIME ZONE 'Asia/Kolkata')::date)
      ORDER BY id DESC`,
     [date || null]
   );
   res.json(rows);
+});
+
+// ---- Correcting a receipt ---------------------------------------------------
+// Whoever entered a movement can fix it on the day they entered it; an owner can
+// fix any of them at any time. Stock is a physical fact, so both paths move the
+// inventory quantity by the difference rather than just rewriting the record.
+const loadCorrectableMovement = async (client, id, user) => {
+  const { rows: [row] } = await client.query('SELECT * FROM stock_ledger WHERE id = $1 FOR UPDATE', [id]);
+  if (!row) return { error: 'That entry no longer exists.', status: 404 };
+  if (row.reference === 'SYSTEM-SEED') return { error: 'Opening balances cannot be edited.', status: 400 };
+  if (row.voided) return { error: 'That entry has already been voided.', status: 400 };
+  if (user.role !== 'admin') {
+    if (row.action_by !== user.email) {
+      return { error: 'Only the person who entered this, or an owner, can change it.', status: 403 };
+    }
+    const sameDay = await client.query(
+      `SELECT (created_at AT TIME ZONE 'Asia/Kolkata')::date
+             = (NOW() AT TIME ZONE 'Asia/Kolkata')::date AS today
+       FROM stock_ledger WHERE id = $1`, [id]
+    ).then(r => r.rows[0]?.today);
+    if (!sameDay) return { error: 'Entries from an earlier day can only be corrected by an owner.', status: 403 };
+  }
+  return { row };
+};
+
+// Adjust the inventory row this movement contributed to, by `delta` in the
+// direction the movement itself counts.
+const applyStockDelta = async (client, row, delta) => {
+  if (!delta) return;
+  const signed = ['IN', 'OPENING', 'TRANSFER-IN', 'ADJUST'].includes(row.movement_type) ? delta : -delta;
+  const { rows: [inv] } = await client.query(
+    'SELECT id, quantity FROM inventory WHERE LOWER(name) = LOWER($1) AND godown = $2 FOR UPDATE',
+    [row.name, row.godown]
+  );
+  if (!inv) return;                       // item since deleted; ledger still corrected
+  const next = +(inv.quantity + signed).toFixed(3);
+  if (next < 0) throw new Error(`That change would take ${row.name} in ${row.godown} below zero (${inv.quantity} in stock).`);
+  await client.query('UPDATE inventory SET quantity = $1 WHERE id = $2', [next, inv.id]);
+};
+
+app.put('/api/movements/:id', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { row, error, status } = await loadCorrectableMovement(client, req.params.id, req.user);
+    if (error) { await client.query('ROLLBACK'); return res.status(status).json({ error }); }
+
+    const qty = req.body.quantity === undefined ? row.quantity : parseFloat(req.body.quantity);
+    if (!isFinite(qty) || qty <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Quantity must be greater than zero' });
+    }
+    await applyStockDelta(client, row, +(qty - row.quantity).toFixed(3));
+
+    const { rows: [updated] } = await client.query(
+      `UPDATE stock_ledger
+       SET quantity = $1, unit = COALESCE(NULLIF($2,''), unit), remarks = $3,
+           edited_at = NOW(),
+           edit_note = $4
+       WHERE id = $5 RETURNING *`,
+      [qty, (req.body.unit || '').trim(), (req.body.remarks || '').trim() || null,
+       `was ${row.quantity} ${row.unit || ''}, corrected by ${req.user.email}`.trim(), row.id]
+    );
+    await client.query('COMMIT');
+    res.json(updated);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/movements/:id/void', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { row, error, status } = await loadCorrectableMovement(client, req.params.id, req.user);
+    if (error) { await client.query('ROLLBACK'); return res.status(status).json({ error }); }
+
+    await applyStockDelta(client, row, -row.quantity);
+    await client.query(
+      `UPDATE stock_ledger
+       SET voided = TRUE, voided_by = $1, voided_at = NOW(), void_reason = $2
+       WHERE id = $3`,
+      [req.user.email, (req.body?.reason || '').trim() || null, row.id]
+    );
+    await client.query('COMMIT');
+    res.json({ message: 'Entry voided', id: row.id, quantity: row.quantity });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
 app.put('/api/inventory/:id/issue', auth, async (req, res) => {

@@ -105,6 +105,9 @@ const InventoryApp = () => {
   const [drGodown, setDrGodown] = useState('');
   const [drRemarks, setDrRemarks] = useState('');
   const [drMsg, setDrMsg] = useState('');
+  // Which receipt row is being corrected, and how: {id, mode:'edit'|'void', ...}
+  const [drAction, setDrAction] = useState(null);
+  const [drBusy, setDrBusy] = useState(false);
 
   // Stock Ledger
   const [showLedger, setShowLedger] = useState(false);
@@ -432,6 +435,40 @@ const InventoryApp = () => {
     setDrItem(''); setDrQty(''); setDrRemarks('');
     setDrMsg(dailyDate === istToday() ? '✅ Added to today’s receipts' : `✅ Added to the ${prettyDay(dailyDate)} sheet`);
     setTimeout(() => setDrMsg(''), 2500);
+  };
+
+  const startEdit = (r) => setDrAction({ id: r.id, mode: 'edit', qty: String(r.quantity), remarks: r.remarks || '' });
+  const startVoid = (r) => setDrAction({ id: r.id, mode: 'void', reason: '' });
+  const cancelAction = () => setDrAction(null);
+
+  const saveReceiptEdit = async () => {
+    const qty = parseFloat(drAction.qty);
+    if (!isFinite(qty) || qty <= 0) { notify('Quantity must be greater than zero', 'error'); return; }
+    setDrBusy(true);
+    const res = await fetch(`${API}/movements/${drAction.id}`, {
+      method: 'PUT', headers: authHeaders(),
+      body: JSON.stringify({ quantity: qty, remarks: drAction.remarks }),
+    });
+    const data = await res.json();
+    setDrBusy(false);
+    if (!res.ok) { notify(data.error || 'Could not save the correction', 'error'); return; }
+    setDrAction(null);
+    await loadInventory(); await loadDailyReceipts();
+    notify('Entry corrected. Stock adjusted by the difference.', 'success');
+  };
+
+  const confirmVoid = async () => {
+    setDrBusy(true);
+    const res = await fetch(`${API}/movements/${drAction.id}/void`, {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({ reason: drAction.reason }),
+    });
+    const data = await res.json();
+    setDrBusy(false);
+    if (!res.ok) { notify(data.error || 'Could not void the entry', 'error'); return; }
+    setDrAction(null);
+    await loadInventory(); await loadDailyReceipts();
+    notify(`Entry voided and ${data.quantity} taken back out of stock.`, 'success');
   };
 
   // Draw one page of the daily-receipt image (up to PER_PAGE items) → PNG File
@@ -982,18 +1019,71 @@ const InventoryApp = () => {
               ) : (
                 <div className="table-wrap">
                   <table>
-                    <thead><tr><th>#</th><th>Item</th><th style={{textAlign:'right'}}>Qty</th><th>Unit</th><th>Kept At</th><th>Remarks</th></tr></thead>
+                    <thead><tr><th>#</th><th>Item</th><th style={{textAlign:'right'}}>Qty</th><th>Unit</th><th>Kept At</th><th>Remarks</th><th style={{textAlign:'right'}}>Fix</th></tr></thead>
                     <tbody>
-                      {dailyReceipts.map((r,i)=>(
-                        <tr key={i}>
+                      {dailyReceipts.map((r,i)=>{
+                        const act = drAction && drAction.id === r.id ? drAction : null;
+                        return (
+                        <React.Fragment key={r.id ?? i}>
+                        <tr style={act ? {background:'#f8fafc'} : undefined}>
                           <td style={{color:'#94a3b8'}}>{i+1}</td>
-                          <td style={{fontWeight:600,color:'#0f172a'}}>{r.name}</td>
-                          <td style={{textAlign:'right',fontWeight:700}}>{r.quantity}</td>
+                          <td style={{fontWeight:600,color:'#0f172a'}}>{r.name}
+                            {r.edited_at && <span title="corrected" style={{marginLeft:6,color:'#b45309',fontSize:11,fontWeight:700}}>edited</span>}</td>
+                          <td style={{textAlign:'right',fontWeight:700}}>
+                            {act && act.mode === 'edit'
+                              ? <input className="input" type="number" step="any" min="0" autoFocus
+                                  style={{marginBottom:0,width:100,textAlign:'right',padding:'5px 8px'}}
+                                  value={act.qty} onChange={e=>setDrAction({...act, qty:e.target.value})}
+                                  onKeyDown={e=>{ if(e.key==='Enter') saveReceiptEdit(); if(e.key==='Escape') cancelAction(); }} />
+                              : r.quantity}
+                          </td>
                           <td>{r.unit}</td>
                           <td><span style={{background:'#eef2ff',color:'#4338ca',padding:'2px 10px',borderRadius:20,fontSize:12,fontWeight:600}}>{r.godown}</span></td>
-                          <td style={{color:'#64748b',fontSize:12}}>{r.remarks||'-'}</td>
+                          <td style={{color:'#64748b',fontSize:12}}>
+                            {act && act.mode === 'edit'
+                              ? <input className="input" style={{marginBottom:0,padding:'5px 8px',minWidth:110}}
+                                  placeholder="Remarks" value={act.remarks}
+                                  onChange={e=>setDrAction({...act, remarks:e.target.value})}
+                                  onKeyDown={e=>{ if(e.key==='Enter') saveReceiptEdit(); if(e.key==='Escape') cancelAction(); }} />
+                              : (r.remarks||'-')}
+                          </td>
+                          <td style={{textAlign:'right',whiteSpace:'nowrap'}}>
+                            {act ? (
+                              act.mode === 'edit'
+                                ? <>
+                                    <button className="btn btn-green btn-sm" disabled={drBusy} onClick={saveReceiptEdit}>Save</button>{' '}
+                                    <button className="btn btn-light btn-sm" disabled={drBusy} onClick={cancelAction}>Cancel</button>
+                                  </>
+                                : null
+                            ) : (
+                              <>
+                                <button className="btn btn-light btn-sm" title="Correct the quantity" onClick={()=>startEdit(r)}>&#9998;</button>{' '}
+                                <button className="btn btn-red btn-sm" title="Void this entry" onClick={()=>startVoid(r)}>&#128465;</button>
+                              </>
+                            )}
+                          </td>
                         </tr>
-                      ))}
+                        {act && act.mode === 'void' && (
+                          <tr>
+                            <td colSpan={7} style={{background:'#fef2f2',borderTop:'none'}}>
+                              <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',padding:'4px 0'}}>
+                                <span style={{color:'#991b1b',fontWeight:700,fontSize:13}}>
+                                  Void {r.quantity} {r.unit} of {r.name}? This takes it back out of {r.godown}.
+                                </span>
+                                <input className="input" style={{marginBottom:0,flex:'1 1 180px',padding:'5px 9px'}}
+                                  placeholder="Reason (optional)" autoFocus value={act.reason}
+                                  onChange={e=>setDrAction({...act, reason:e.target.value})}
+                                  onKeyDown={e=>{ if(e.key==='Enter') confirmVoid(); if(e.key==='Escape') cancelAction(); }} />
+                                <button className="btn btn-red btn-sm" disabled={drBusy} onClick={confirmVoid}>
+                                  {drBusy ? 'Voiding...' : 'Void it'}
+                                </button>
+                                <button className="btn btn-light btn-sm" disabled={drBusy} onClick={cancelAction}>Cancel</button>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                        </React.Fragment>
+                      );})}
                     </tbody>
                   </table>
                 </div>
@@ -1511,6 +1601,7 @@ const InventoryApp = () => {
                   </thead>
                   <tbody>
                     {ledgerRows.map(row => {
+                      const isVoid = !!row.voided;
                       const isAdjust = row.movement_type === 'ADJUST';
                       const isIn = ['IN','OPENING','TRANSFER-IN'].includes(row.movement_type);
                       const qty = parseFloat(row.quantity);
@@ -1526,9 +1617,10 @@ const InventoryApp = () => {
                       };
                       const tc = typeColors[row.movement_type] || {bg:'#f1f5f9',color:'#475569'};
                       return (
-                        <tr key={row.id}>
+                        <tr key={row.id} style={isVoid ? {opacity:.55} : undefined}>
                           <td style={{color:'#94a3b8',fontSize:12,whiteSpace:'nowrap'}}>{showDate(row.action_date)}</td>
-                          <td style={{fontWeight:600}}>{row.name}</td>
+                          <td style={{fontWeight:600,textDecoration:isVoid?'line-through':'none'}}>{row.name}
+                            {isVoid && <span title={row.void_reason || 'voided'} style={{marginLeft:6,background:'#fee2e2',color:'#991b1b',padding:'1px 7px',borderRadius:20,fontSize:10,fontWeight:700,textDecoration:'none',display:'inline-block'}}>VOID</span>}</td>
                           <td style={{color:'#475569'}}>{row.godown}</td>
                           <td><span style={{background:tc.bg,color:tc.color,padding:'2px 8px',borderRadius:20,fontSize:11,fontWeight:700,whiteSpace:'nowrap'}}>{row.movement_type}</span></td>
                           <td style={{textAlign:'right',fontWeight:600,color: qtyColor}}>{qtyText}</td>
