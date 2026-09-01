@@ -1255,6 +1255,74 @@ app.get('/api/verifications/:id', auth, async (req, res) => {
   res.json({ ...header, lines });
 });
 
+// Void a whole day's worth of entries in one go. All or nothing: if any single
+// entry cannot be reversed the entire batch rolls back and the caller is told
+// exactly which ones blocked, so a half-cleaned day is never left behind.
+app.post('/api/movements/void-batch', auth, async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.slice(0, 500) : [];
+  if (!ids.length) return res.status(400).json({ error: 'Nothing selected' });
+  const recordOnly = req.body?.stock_effect === 'record_only';
+  const reason = (req.body?.reason || '').trim();
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const done = [];
+    const blocked = [];
+    const skipped = [];
+
+    for (const id of ids) {
+      const { row, error } = await loadCorrectableMovement(client, id, req.user);
+      if (error) { skipped.push({ id, reason: error }); continue; }
+
+      if (!recordOnly) {
+        try {
+          await applyStockDelta(client, row, -row.quantity);
+        } catch (e) {
+          if (e.code === 'BELOW_ZERO') {
+            blocked.push({ id, name: row.name, godown: row.godown,
+                           quantity: row.quantity, available: e.available });
+            continue;
+          }
+          throw e;
+        }
+      }
+
+      await client.query(
+        `UPDATE stock_ledger
+         SET voided = TRUE, voided_by = $1, voided_at = NOW(), void_reason = $2
+         WHERE id = $3`,
+        [req.user.email,
+         recordOnly ? `[record only, stock left at counted figure] ${reason}`.trim() : (reason || null),
+         id]
+      );
+      done.push({ id, name: row.name, quantity: row.quantity });
+    }
+
+    if (blocked.length) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        code: 'BELOW_ZERO',
+        error: `${blocked.length} of ${ids.length} entries cannot be reversed because the stock has moved on since. Nothing was changed.`,
+        blocked,
+      });
+    }
+
+    await client.query('COMMIT');
+    res.json({
+      voided: done.length, skipped, stock_changed: !recordOnly,
+      message: recordOnly
+        ? `${done.length} entr(y/ies) voided, stock left as counted.`
+        : `${done.length} entr(y/ies) voided and taken back out of stock.`,
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.post('/api/extract', auth, async (req, res) => {
   const { text, imageBase64, mediaType } = req.body;
   const apiKey = process.env.ANTHROPIC_API_KEY;

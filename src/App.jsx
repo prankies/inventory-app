@@ -108,6 +108,7 @@ const InventoryApp = () => {
   // Which receipt row is being corrected, and how: {id, mode:'edit'|'void', ...}
   const [drAction, setDrAction] = useState(null);
   const [drBusy, setDrBusy] = useState(false);
+  const [drBatch, setDrBatch] = useState(null);   // {reason, blocked?} while voiding a whole day
 
   // Stock Ledger
   const [showLedger, setShowLedger] = useState(false);
@@ -481,6 +482,29 @@ const InventoryApp = () => {
     notify(data.stock_changed
       ? `Entry voided and ${data.quantity} taken back out of stock.`
       : 'Entry voided. Stock left at the counted figure.', 'success');
+  };
+
+  const voidWholeDay = async (stockEffect) => {
+    const ids = dailyReceipts.map(r => r.id).filter(Boolean);
+    if (!ids.length) { notify('Nothing on this sheet to void.', 'error'); return; }
+    setDrBusy(true);
+    const res = await fetch(`${API}/movements/void-batch`, {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({ ids, reason: drBatch?.reason || '', stock_effect: stockEffect || 'reverse' }),
+    });
+    const data = await res.json();
+    setDrBusy(false);
+    if (!res.ok) {
+      if (data.code === 'BELOW_ZERO') { setDrBatch({ ...drBatch, blocked: data.blocked || [] }); return; }
+      notify(data.error || 'Could not void the day.', 'error');
+      return;
+    }
+    setDrBatch(null);
+    await loadInventory(); await loadDailyReceipts();
+    notify(data.message, 'success');
+    if (data.skipped?.length) {
+      notify(`${data.skipped.length} entr(y/ies) were left alone: ${data.skipped[0].reason}`, 'info');
+    }
   };
 
   // Draw one page of the daily-receipt image (up to PER_PAGE items) → PNG File
@@ -1019,6 +1043,63 @@ const InventoryApp = () => {
                 </div>
               </div>
             </form>
+
+            {/* Void the whole day */}
+            {dailyReceipts.length > 1 && (
+              <div style={{marginTop:14}}>
+                {!drBatch ? (
+                  <button className="btn btn-light btn-sm" onClick={()=>setDrBatch({reason:''})}>
+                    Void all {dailyReceipts.length} entries on this sheet
+                  </button>
+                ) : !drBatch.blocked ? (
+                  <div style={{padding:12,borderRadius:10,background:'#fef2f2',border:'1px solid #fecaca'}}>
+                    <div style={{color:'#991b1b',fontWeight:700,fontSize:13,marginBottom:8}}>
+                      Void every one of the {dailyReceipts.length} entries on {prettyDay(dailyDate)}?
+                    </div>
+                    <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
+                      <input className="input" style={{marginBottom:0,flex:'1 1 200px',padding:'6px 9px'}}
+                        placeholder="Reason (optional)" autoFocus value={drBatch.reason}
+                        onChange={e=>setDrBatch({...drBatch, reason:e.target.value})} />
+                      <button className="btn btn-red btn-sm" disabled={drBusy} onClick={()=>voidWholeDay('reverse')}>
+                        {drBusy ? 'Voiding...' : 'Void and take back out of stock'}
+                      </button>
+                      <button className="btn btn-light btn-sm" disabled={drBusy} onClick={()=>setDrBatch(null)}>Cancel</button>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{padding:12,borderRadius:10,background:'#fff7ed',border:'1px solid #fed7aa'}}>
+                    <div style={{color:'#b45309',fontWeight:700,fontSize:13,marginBottom:6}}>
+                      {drBatch.blocked.length} of these cannot be reversed — nothing was changed.
+                    </div>
+                    <div style={{fontSize:12.5,color:'#7c2d12',marginBottom:8,lineHeight:1.5}}>
+                      The stock has moved on since these were entered, or a physical count has already set
+                      the real figure. Taking the quantities out again would count the same correction twice.
+                    </div>
+                    <div className="table-wrap" style={{marginBottom:10,maxHeight:180,overflowY:'auto'}}>
+                      <table>
+                        <thead><tr><th>Item</th><th>Godown</th><th style={{textAlign:'right'}}>Entry</th><th style={{textAlign:'right'}}>In stock</th></tr></thead>
+                        <tbody>
+                          {drBatch.blocked.map(b=>(
+                            <tr key={b.id}>
+                              <td style={{fontWeight:600}}>{b.name}</td>
+                              <td style={{color:'#64748b',fontSize:12}}>{b.godown}</td>
+                              <td style={{textAlign:'right',fontWeight:700}}>{b.quantity}</td>
+                              <td style={{textAlign:'right',color:'#b45309',fontWeight:700}}>{b.available}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+                      <button className="btn btn-red btn-sm" disabled={drBusy} onClick={()=>voidWholeDay('record_only')}>
+                        {drBusy ? 'Voiding...' : 'Void the records, leave stock as counted'}
+                      </button>
+                      <button className="btn btn-light btn-sm" disabled={drBusy} onClick={()=>setDrBatch(null)}>Leave them alone</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Received list for the selected day */}
             <div style={{marginTop:16}}>
