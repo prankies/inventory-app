@@ -651,12 +651,11 @@ app.post('/api/inventory/transfer', auth, async (req, res) => {
     const source = sourceRows[0];
     if (source.quantity < qty) throw Object.assign(new Error(`Only ${source.quantity} ${source.unit} available in ${fromGodown}`), { status: 400 });
 
-    const remainingQty = source.quantity - qty;
-    if (remainingQty === 0) {
-      await client.query('DELETE FROM inventory WHERE id=$1', [source.id]);
-    } else {
-      await client.query('UPDATE inventory SET quantity=$1 WHERE id=$2', [remainingQty, source.id]);
-    }
+    // Keep the row at zero rather than deleting it: an empty shelf is still a
+    // shelf, and dropping the row loses the unit and category and breaks any
+    // later correction that needs to find it.
+    const remainingQty = +(source.quantity - qty).toFixed(3);
+    await client.query('UPDATE inventory SET quantity=$1 WHERE id=$2', [remainingQty, source.id]);
 
     const dateNow = istDate();
     const destRow = await upsertInventory(client, {
@@ -718,15 +717,11 @@ app.post('/api/issue-slips', auth, async (req, res) => {
     for (const it of items) {
       const { rows } = await client.query('SELECT * FROM inventory WHERE id=$1', [it.id]);
       const inv = rows[0];
-      const newQty = inv.quantity - it.quantity;
-      if (newQty === 0) {
-        await client.query('DELETE FROM inventory WHERE id=$1', [inv.id]);
-      } else {
-        await client.query(
-          'UPDATE inventory SET quantity=$1, last_issued=$2, issued_by=$3 WHERE id=$4',
-          [newQty, dateNow, issued_to ? `${req.user.email} -> ${issued_to}` : req.user.email, inv.id]
-        );
-      }
+      const newQty = +(inv.quantity - it.quantity).toFixed(3);
+      await client.query(
+        'UPDATE inventory SET quantity=$1, last_issued=$2, issued_by=$3 WHERE id=$4',
+        [newQty, dateNow, issued_to ? `${req.user.email} -> ${issued_to}` : req.user.email, inv.id]
+      );
       await client.query(
         `INSERT INTO issue_slip_items (slip_id, name, godown, quantity, unit) VALUES ($1,$2,$3,$4,$5)`,
         [slip.id, inv.name, inv.godown, it.quantity, inv.unit || 'pcs']
@@ -965,24 +960,44 @@ app.post('/api/movements/:id/void', auth, async (req, res) => {
   }
 });
 
+// Issuing the last of an item used to DELETE its inventory row. That threw away
+// the unit, category and cost, and -- worse -- left later corrections unable to
+// find the row, so voiding the original receipt silently adjusted nothing. The
+// row now stays at zero, which is what "none in stock" actually means.
 app.put('/api/inventory/:id/issue', auth, async (req, res) => {
   const { quantity, issued_to, remarks } = req.body;
-  const { rows } = await pool.query('SELECT * FROM inventory WHERE id = $1', [req.params.id]);
-  if (!rows.length) return res.status(404).json({ error: 'Item not found' });
-  const item = rows[0];
-  const newQty = item.quantity - quantity;
-  if (newQty < 0) return res.status(400).json({ error: 'Cannot issue more than available' });
-  const dateNow = istDate();
-  await logLedger(pool, { name: item.name, godown: item.godown, movement_type: 'OUT', quantity, unit: item.unit, reference: issued_to || '', remarks: remarks || '', action_by: req.user.email, action_date: dateNow });
-  if (newQty === 0) {
-    await pool.query('DELETE FROM inventory WHERE id = $1', [item.id]);
-    return res.json({ deleted: true });
+  const qty = parseFloat(quantity);
+  if (!isFinite(qty) || qty <= 0) return res.status(400).json({ error: 'Quantity must be greater than zero' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query('SELECT * FROM inventory WHERE id = $1 FOR UPDATE', [req.params.id]);
+    if (!rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Item not found' }); }
+    const item = rows[0];
+    const newQty = +(item.quantity - qty).toFixed(3);
+    if (newQty < 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Cannot issue ${qty} — only ${item.quantity} in ${item.godown}.` });
+    }
+
+    const dateNow = istDate();
+    await logLedger(client, { name: item.name, godown: item.godown, movement_type: 'OUT',
+      quantity: qty, unit: item.unit, reference: issued_to || '', remarks: remarks || '',
+      action_by: req.user.email, action_date: dateNow });
+
+    const { rows: updated } = await client.query(
+      'UPDATE inventory SET quantity=$1, last_issued=$2, issued_by=$3 WHERE id=$4 RETURNING *',
+      [newQty, dateNow, issued_to ? `${req.user.email} -> ${issued_to}` : req.user.email, item.id]
+    );
+    await client.query('COMMIT');
+    res.json(updated[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: err.message });
+  } finally {
+    client.release();
   }
-  const { rows: updated } = await pool.query(
-    'UPDATE inventory SET quantity=$1, last_issued=$2, issued_by=$3 WHERE id=$4 RETURNING *',
-    [newQty, dateNow, issued_to ? `${req.user.email} -> ${issued_to}` : req.user.email, item.id]
-  );
-  res.json(updated[0]);
 });
 
 // Deleting used to remove the row and leave its IN movements behind, so the
@@ -1080,14 +1095,35 @@ app.post('/api/godowns', auth, async (req, res) => {
 });
 
 // Rename godown
+// Renaming used to update godowns and inventory but leave stock_ledger,
+// transfers and issue slips pointing at the old name. That split every item's
+// history into two partitions -- so running balances were wrong -- and left
+// corrections unable to find the inventory row they belonged to.
 app.put('/api/godowns/:oldName', auth, requireAdmin, async (req, res) => {
-  const { newName } = req.body;
+  const newName = (req.body?.newName || '').trim();
   const oldName = decodeURIComponent(req.params.oldName);
+  if (!newName) return res.status(400).json({ error: 'Enter a name' });
+  if (newName === oldName) return res.json({ name: newName });
+
+  const client = await pool.connect();
   try {
-    await pool.query('UPDATE godowns SET name=$1 WHERE name=$2', [newName, oldName]);
-    await pool.query('UPDATE inventory SET godown=$1 WHERE godown=$2', [newName, oldName]);
+    await client.query('BEGIN');
+    await client.query('UPDATE godowns SET name=$1 WHERE name=$2', [newName, oldName]);
+    await client.query('UPDATE inventory SET godown=$1 WHERE godown=$2', [newName, oldName]);
+    await client.query('UPDATE stock_ledger SET godown=$1 WHERE godown=$2', [newName, oldName]);
+    await client.query('UPDATE stock_verification_lines SET godown=$1 WHERE godown=$2', [newName, oldName]);
+    await client.query('UPDATE stock_verifications SET godown=$1 WHERE godown=$2', [newName, oldName]);
+    await client.query('UPDATE issue_slip_items SET godown=$1 WHERE godown=$2', [newName, oldName]);
+    await client.query('UPDATE transfers SET from_godown=$1 WHERE from_godown=$2', [newName, oldName]);
+    await client.query('UPDATE transfers SET to_godown=$1 WHERE to_godown=$2', [newName, oldName]);
+    await client.query('COMMIT');
     res.json({ name: newName });
-  } catch { res.status(400).json({ error: 'Name already exists' }); }
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: 'Name already exists' });
+  } finally {
+    client.release();
+  }
 });
 
 // Delete godown
