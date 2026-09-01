@@ -875,7 +875,19 @@ const applyStockDelta = async (client, row, delta) => {
   );
   if (!inv) return;                       // item since deleted; ledger still corrected
   const next = +(inv.quantity + signed).toFixed(3);
-  if (next < 0) throw new Error(`That change would take ${row.name} in ${row.godown} below zero (${inv.quantity} in stock).`);
+  if (next < 0) {
+    // Usually this means the stock has already moved on since the entry was
+    // made -- it was issued, transferred, or a physical count has since set the
+    // real figure. Reversing again would double-count the correction, so the
+    // caller is told precisely that and offered the record-only route.
+    const err = new Error(
+      `${row.name} in ${row.godown} has only ${inv.quantity} in stock, ` +
+      `so reversing ${Math.abs(signed)} would take it below zero.`);
+    err.code = 'BELOW_ZERO';
+    err.available = inv.quantity;
+    err.required = Math.abs(signed);
+    throw err;
+  }
   await client.query('UPDATE inventory SET quantity = $1 WHERE id = $2', [next, inv.id]);
 };
 
@@ -906,12 +918,18 @@ app.put('/api/movements/:id', auth, async (req, res) => {
     res.json(updated);
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(400).json({ error: err.message });
+    res.status(err.code === 'BELOW_ZERO' ? 409 : 400)
+       .json({ error: err.message, code: err.code, available: err.available, required: err.required });
   } finally {
     client.release();
   }
 });
 
+// stock_effect:
+//   'reverse'      (default) -- take the quantity back out of stock
+//   'record_only'  -- strike the entry from the ledger but leave the stock
+//                     figure alone, for when a physical count has already set
+//                     the true number and reversing would double-count it
 app.post('/api/movements/:id/void', auth, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -919,18 +937,29 @@ app.post('/api/movements/:id/void', auth, async (req, res) => {
     const { row, error, status } = await loadCorrectableMovement(client, req.params.id, req.user);
     if (error) { await client.query('ROLLBACK'); return res.status(status).json({ error }); }
 
-    await applyStockDelta(client, row, -row.quantity);
+    const recordOnly = req.body?.stock_effect === 'record_only';
+    if (!recordOnly) await applyStockDelta(client, row, -row.quantity);
+
+    const reason = (req.body?.reason || '').trim();
     await client.query(
       `UPDATE stock_ledger
        SET voided = TRUE, voided_by = $1, voided_at = NOW(), void_reason = $2
        WHERE id = $3`,
-      [req.user.email, (req.body?.reason || '').trim() || null, row.id]
+      [req.user.email,
+       recordOnly
+         ? `[record only, stock left at counted figure] ${reason}`.trim()
+         : (reason || null),
+       row.id]
     );
     await client.query('COMMIT');
-    res.json({ message: 'Entry voided', id: row.id, quantity: row.quantity });
+    res.json({
+      message: recordOnly ? 'Entry voided, stock left as it was' : 'Entry voided',
+      id: row.id, quantity: row.quantity, stock_changed: !recordOnly,
+    });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(400).json({ error: err.message });
+    res.status(err.code === 'BELOW_ZERO' ? 409 : 400)
+       .json({ error: err.message, code: err.code, available: err.available, required: err.required });
   } finally {
     client.release();
   }

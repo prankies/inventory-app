@@ -457,18 +457,30 @@ const InventoryApp = () => {
     notify('Entry corrected. Stock adjusted by the difference.', 'success');
   };
 
-  const confirmVoid = async () => {
+  const confirmVoid = async (stockEffect) => {
     setDrBusy(true);
     const res = await fetch(`${API}/movements/${drAction.id}/void`, {
       method: 'POST', headers: authHeaders(),
-      body: JSON.stringify({ reason: drAction.reason }),
+      body: JSON.stringify({ reason: drAction.reason, stock_effect: stockEffect || 'reverse' }),
     });
     const data = await res.json();
     setDrBusy(false);
-    if (!res.ok) { notify(data.error || 'Could not void the entry', 'error'); return; }
+    if (!res.ok) {
+      // Stock has moved on since this entry -- most often a physical count has
+      // already set the true figure. Offer the record-only route in place of a
+      // dead end, rather than just repeating the error.
+      if (data.code === 'BELOW_ZERO') {
+        setDrAction({ ...drAction, blocked: { available: data.available, required: data.required } });
+        return;
+      }
+      notify(data.error || 'Could not void the entry', 'error');
+      return;
+    }
     setDrAction(null);
     await loadInventory(); await loadDailyReceipts();
-    notify(`Entry voided and ${data.quantity} taken back out of stock.`, 'success');
+    notify(data.stock_changed
+      ? `Entry voided and ${data.quantity} taken back out of stock.`
+      : 'Entry voided. Stock left at the counted figure.', 'success');
   };
 
   // Draw one page of the daily-receipt image (up to PER_PAGE items) → PNG File
@@ -1066,19 +1078,38 @@ const InventoryApp = () => {
                         {act && act.mode === 'void' && (
                           <tr>
                             <td colSpan={7} style={{background:'#fef2f2',borderTop:'none'}}>
-                              <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',padding:'4px 0'}}>
-                                <span style={{color:'#991b1b',fontWeight:700,fontSize:13}}>
-                                  Void {r.quantity} {r.unit} of {r.name}? This takes it back out of {r.godown}.
-                                </span>
-                                <input className="input" style={{marginBottom:0,flex:'1 1 180px',padding:'5px 9px'}}
-                                  placeholder="Reason (optional)" autoFocus value={act.reason}
-                                  onChange={e=>setDrAction({...act, reason:e.target.value})}
-                                  onKeyDown={e=>{ if(e.key==='Enter') confirmVoid(); if(e.key==='Escape') cancelAction(); }} />
-                                <button className="btn btn-red btn-sm" disabled={drBusy} onClick={confirmVoid}>
-                                  {drBusy ? 'Voiding...' : 'Void it'}
-                                </button>
-                                <button className="btn btn-light btn-sm" disabled={drBusy} onClick={cancelAction}>Cancel</button>
-                              </div>
+                              {!act.blocked ? (
+                                <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',padding:'4px 0'}}>
+                                  <span style={{color:'#991b1b',fontWeight:700,fontSize:13}}>
+                                    Void {r.quantity} {r.unit} of {r.name}? This takes it back out of {r.godown}.
+                                  </span>
+                                  <input className="input" style={{marginBottom:0,flex:'1 1 180px',padding:'5px 9px'}}
+                                    placeholder="Reason (optional)" autoFocus value={act.reason}
+                                    onChange={e=>setDrAction({...act, reason:e.target.value})}
+                                    onKeyDown={e=>{ if(e.key==='Enter') confirmVoid('reverse'); if(e.key==='Escape') cancelAction(); }} />
+                                  <button className="btn btn-red btn-sm" disabled={drBusy} onClick={()=>confirmVoid('reverse')}>
+                                    {drBusy ? 'Voiding...' : 'Void it'}
+                                  </button>
+                                  <button className="btn btn-light btn-sm" disabled={drBusy} onClick={cancelAction}>Cancel</button>
+                                </div>
+                              ) : (
+                                <div style={{padding:'6px 0'}}>
+                                  <div style={{color:'#991b1b',fontWeight:700,fontSize:13,marginBottom:4}}>
+                                    {r.name} has only {act.blocked.available} in {r.godown}, but this entry is for {act.blocked.required}.
+                                  </div>
+                                  <div style={{color:'#7f1d1d',fontSize:12.5,marginBottom:9,lineHeight:1.5}}>
+                                    The stock has moved on since this was entered — it was issued or transferred,
+                                    or a physical count has already set the real figure. Taking {act.blocked.required} out
+                                    again would count the same correction twice.
+                                  </div>
+                                  <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+                                    <button className="btn btn-red btn-sm" disabled={drBusy} onClick={()=>confirmVoid('record_only')}>
+                                      {drBusy ? 'Voiding...' : `Void the record, leave stock at ${act.blocked.available}`}
+                                    </button>
+                                    <button className="btn btn-light btn-sm" disabled={drBusy} onClick={cancelAction}>Leave it alone</button>
+                                  </div>
+                                </div>
+                              )}
                             </td>
                           </tr>
                         )}
