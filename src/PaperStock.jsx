@@ -311,6 +311,13 @@ const EntryTab = ({ kind, items, call, notify, isAdmin, currentUser, reload }) =
   const [busy, setBusy] = useState(false);
   const [entries, setEntries] = useState([]);
   const [voiding, setVoiding] = useState(null); // {id, reason}
+  // Sales happen one at a time through the day, so issues default to a
+  // one-paper form; a delivery challan is easier on the full grid.
+  const [mode, setMode] = useState(isOut ? 'quick' : 'grid');
+  const [qItem, setQItem] = useState('');
+  const [qC, setQC] = useState('');
+  const [qR, setQR] = useState('');
+  const paperSelect = useRef(null);
 
   const loadEntries = useCallback(async () => {
     const { ok, data } = await call(`/movements?date=${date}`);
@@ -319,23 +326,29 @@ const EntryTab = ({ kind, items, call, notify, isAdmin, currentUser, reload }) =
   useEffect(() => { loadEntries(); }, [loadEntries]);
 
   const setQ = (id, field, v) => setQty(prev => ({ ...prev, [id]: { ...(prev[id] || {}), [field]: v } }));
-  const lines = Object.entries(qty)
+  const gridLines = Object.entries(qty)
     .map(([id, v]) => ({ item_id: +id, cartons: n(v.c), reams: n(v.r) }))
     .filter(l => l.cartons || l.reams);
-  const lineTotal = lines.reduce((s, l) => ({ c: s.c + l.cartons, r: s.r + l.reams }), { c: 0, r: 0 });
+  const lineTotal = gridLines.reduce((s, l) => ({ c: s.c + l.cartons, r: s.r + l.reams }), { c: 0, r: 0 });
 
-  const needsOpen = (i) => {
-    const v = qty[i.id] || {};
+  const needsOpen = (i, v = qty[i.id] || {}) => {
     const r = n(v.r), c = n(v.c);
     const open = r > n(i.reams) && i.reams_per_carton ? Math.ceil((r - n(i.reams)) / i.reams_per_carton) : 0;
     const short = c + open > n(i.cartons) || (r > n(i.reams) && !i.reams_per_carton);
     return { open, short };
   };
 
+  const quickPaper = items.find(i => String(i.id) === qItem);
+  const quickLines = quickPaper && (n(qC) || n(qR)) ? [{ item_id: quickPaper.id, cartons: n(qC), reams: n(qR) }] : [];
+  const quickChk = isOut && quickPaper ? needsOpen(quickPaper, { c: qC, r: qR }) : { open: 0, short: false };
+  const quick = mode === 'quick';
+
   const save = async () => {
-    if (!lines.length) { notify('Type a carton or ream figure against at least one paper.', 'error'); return; }
-    if (isOut && lines.some(l => needsOpen(items.find(i => i.id === l.item_id) || {}).short)) {
-      notify('Some papers do not have that much stock. Check the rows marked in red.', 'error'); return;
+    const lines = quick ? quickLines : gridLines;
+    if (quick && !quickPaper) { notify('Choose the paper.', 'error'); return; }
+    if (!lines.length) { notify(quick ? 'Type the cartons or reams.' : 'Type a carton or ream figure against at least one paper.', 'error'); return; }
+    if (isOut && lines.some(l => needsOpen(items.find(i => i.id === l.item_id) || {}, quick ? { c: qC, r: qR } : undefined).short)) {
+      notify(quick ? 'Not enough stock of this paper.' : 'Some papers do not have that much stock. Check the rows marked in red.', 'error'); return;
     }
     setBusy(true);
     const kindCode = isOut ? 'OUT' : opening ? 'OPENING' : 'IN';
@@ -345,9 +358,12 @@ const EntryTab = ({ kind, items, call, notify, isAdmin, currentUser, reload }) =
     });
     setBusy(false);
     if (!ok) { notify(data.error || 'Could not save', 'error'); return; }
+    const soldLabel = quick ? `${quickPaper.label}: ${cr(qC, qR)}` : null;
     setQty({}); setParty(''); setReference(''); setRemarks('');
+    setQItem(''); setQC(''); setQR('');
     await reload(); await loadEntries();
-    notify(`${data.saved} paper(s) saved${date !== istToday() ? ` on ${prettyDay(date)}` : ''}.`
+    if (quick) paperSelect.current?.focus();
+    notify(`${soldLabel || `${data.saved} paper(s)`} saved${date !== istToday() ? ` on ${prettyDay(date)}` : ''}.`
       + (data.opened?.length ? `\nOpened ${data.opened.join(', ')}.` : ''), 'success');
   };
 
@@ -372,6 +388,12 @@ const EntryTab = ({ kind, items, call, notify, isAdmin, currentUser, reload }) =
       <div className="card paper-entry-card" style={{ border: `2px solid ${isOut ? '#ea580c' : '#16a34a'}` }}>
         <div className="card-title" style={{ justifyContent: 'space-between', flexWrap: 'wrap' }}>
           <span>{isOut ? '📤 Sale / Issue' : opening ? '📥 Opening Stock' : '📥 Stock Received'}</span>
+          {isOut && (
+            <div className="mode-tabs" style={{ marginBottom: 0 }}>
+              <button className={`mode-tab ${quick ? 'active' : ''}`} onClick={() => setMode('quick')}>One sale</button>
+              <button className={`mode-tab ${!quick ? 'active' : ''}`} onClick={() => setMode('grid')}>Many papers</button>
+            </div>
+          )}
           {!isOut && (
             <div className="mode-tabs" style={{ marginBottom: 0 }}>
               <button className={`mode-tab ${!opening ? 'active' : ''}`} onClick={() => setOpening(false)}>Received</button>
@@ -387,6 +409,38 @@ const EntryTab = ({ kind, items, call, notify, isAdmin, currentUser, reload }) =
         )}
         {!today && (
           <div className="paper-note amber">Recording against {prettyDay(date)}, not today.</div>
+        )}
+
+        {quick && items.length > 0 && (
+          <form className="paper-quick" onSubmit={e => { e.preventDefault(); save(); }}>
+            <div className="pq-paper">
+              <label className="field-label">Paper *</label>
+              <select ref={paperSelect} className="input" style={{ marginBottom: 0 }} value={qItem} onChange={e => setQItem(e.target.value)}>
+                <option value="">Choose paper…</option>
+                {items.map(i => <option key={i.id} value={i.id}>{i.label}  ({cr(i.cartons, i.reams)})</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="field-label">Carton</label>
+              <input className="input" style={{ marginBottom: 0 }} type="number" inputMode="numeric" min="0" step="any" placeholder="0"
+                value={qC} onChange={e => setQC(e.target.value)} />
+            </div>
+            <div>
+              <label className="field-label">Ream</label>
+              <input className="input" style={{ marginBottom: 0 }} type="number" inputMode="numeric" min="0" step="any" placeholder="0"
+                value={qR} onChange={e => setQR(e.target.value)} />
+            </div>
+            <button className="btn btn-orange pq-save" type="submit" disabled={busy || !quickLines.length || quickChk.short}>
+              {busy ? 'Saving…' : '💾 Save sale'}
+            </button>
+            {quickPaper && (
+              <div className="pq-info">
+                In stock: <strong>{cr(quickPaper.cartons, quickPaper.reams)}</strong>
+                {quickChk.short && <span style={{ color: 'var(--red)' }}> — not enough stock</span>}
+                {!quickChk.short && quickChk.open > 0 && <span style={{ color: '#b45309' }}> — opens {quickChk.open} carton{quickChk.open > 1 ? 's' : ''}</span>}
+              </div>
+            )}
+          </form>
         )}
 
         <div className="paper-head-row">
@@ -411,7 +465,7 @@ const EntryTab = ({ kind, items, call, notify, isAdmin, currentUser, reload }) =
 
         {items.length === 0 ? (
           <div className="paper-empty">Add your papers in the Stock tab first.</div>
-        ) : (
+        ) : quick ? null : (
           <>
             {items.length > 8 && (
               <input className="input" style={{ marginTop: 14, marginBottom: 0 }} placeholder="🔍 Filter papers"
@@ -457,10 +511,10 @@ const EntryTab = ({ kind, items, call, notify, isAdmin, currentUser, reload }) =
               </table>
             </div>
             <div style={{ display: 'flex', gap: 10, marginTop: 14, alignItems: 'center', flexWrap: 'wrap' }}>
-              <button className={`btn ${isOut ? 'btn-orange' : 'btn-green'}`} disabled={busy || !lines.length} onClick={save}>
-                {busy ? 'Saving…' : `💾 Save ${lines.length ? `${lines.length} paper${lines.length > 1 ? 's' : ''}` : ''}`}
+              <button className={`btn ${isOut ? 'btn-orange' : 'btn-green'}`} disabled={busy || !gridLines.length} onClick={save}>
+                {busy ? 'Saving…' : `💾 Save ${gridLines.length ? `${gridLines.length} paper${gridLines.length > 1 ? 's' : ''}` : ''}`}
               </button>
-              {lines.length > 0 && (
+              {gridLines.length > 0 && (
                 <>
                   <span style={{ fontSize: 13, color: 'var(--text-2)', fontWeight: 600 }}>Total {cr(lineTotal.c, lineTotal.r)}</span>
                   <button className="btn btn-light btn-sm" onClick={() => setQty({})}>Clear</button>

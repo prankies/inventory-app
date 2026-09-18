@@ -294,3 +294,12 @@ tbody tr:hover td { background: var(--primary-50); }
   .paper-entry-card { padding: 14px 10px; }
   .register td:nth-child(2) { white-space: normal !important; min-width: 110px; }
 }
+
+.paper-quick { display: grid; grid-template-columns: 2fr 90px 90px auto; gap: 10px; align-items: end; margin-bottom: 14px;
+  padding: 14px; border-radius: 10px; background: #fff7ed; border: 1px solid #fed7aa; }
+.paper-quick .pq-info { grid-column: 1 / -1; font-size: 13px; color: var(--text-2); }
+@media (max-width: 640px) {
+  .paper-quick { grid-template-columns: 1fr 1fr; padding: 10px; }
+  .paper-quick .pq-paper, .paper-quick .pq-save { grid-column: 1 / -1; }
+  .paper-quick .pq-save { justify-content: center; padding: 12px; font-size: 15px; }
+}
