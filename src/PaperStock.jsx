@@ -585,8 +585,9 @@ const ReportTab = ({ call, notify, currentUser }) => {
     for (let i = 0; i < list.length; i += REPORT_PER_PAGE) pages.push(list.slice(i, i + REPORT_PER_PAGE));
     const files = [];
     for (let p = 0; p < pages.length; p++) files.push(await drawReportPage(pages[p], p, pages.length, date, p * REPORT_PER_PAGE));
-    const text = `*Paper Stock — ${prettyDay(date)}*\n` + list.filter(moved).map(r =>
-      `${r.label}: ${n(r.in_c) || n(r.in_r) ? `In ${cr(r.in_c, r.in_r)}, ` : ''}${n(r.out_c) || n(r.out_r) ? `Issue ${cr(r.out_c, r.out_r)}, ` : ''}Closing ${cr(r.close_c, r.close_r)}`
+    // The message text carries only the closing balance; the full register is in the image.
+    const text = `*Paper Stock Closing — ${prettyDay(date)}*\n` + list.map((r, k) =>
+      `${k + 1}. ${r.label}: ${n(r.close_c)} Ctn + ${n(r.close_r)} Ream`
     ).join('\n');
     if (navigator.canShare && navigator.canShare({ files })) {
       try { await navigator.share({ files, text }); } catch { /* cancelled */ }
