@@ -16,7 +16,7 @@ const REGISTER_PAPERS = [
   ['ORIENT', 'A4', 75], ['ORIENT', 'A3', 70], ['ORIENT', 'A5', 70], ['JK EASY', 'FS', 0],
   ['JK RED', 'A3', 0], ['MAPLE', 'A4', 0], ['MAPLE', 'A3', 0], ['ELENZA', 'A3', 0],
   ['PINK', 'A4', 0], ['YELLOW', 'A4', 0], ['GREEN', 'A4', 0], ['BLUE', 'A4', 0],
-].map(([brand, size, gsm]) => ({ brand, size, gsm, reams_per_carton: size === 'A5' ? 10 : 5 }));
+].map(([brand, size, gsm]) => ({ brand, size, gsm, reams_per_carton: 10 }));
 
 const istToday = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 const parseYmd = (s) => { const [y, m, d] = s.split('-'); return new Date(+y, +m - 1, +d); };
@@ -33,6 +33,18 @@ const cr = (c, r) => {
   return parts.join(' + ') || '0';
 };
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+
+// Register columns: all carton figures together, then all loose-ream figures.
+// Movement columns (In / Issue) are left blank at zero, as on the paper sheet.
+const STAGES = [
+  { key: 'open', label: 'Opening', cls: '', color: '#334155', blank: false },
+  { key: 'in', label: 'In', cls: 'c-in', color: '#15803d', blank: true },
+  { key: 'out', label: 'Issue', cls: 'c-out', color: '#c2410c', blank: true },
+  { key: 'close', label: 'Closing', cls: 'c-close', color: '#4338ca', blank: false },
+];
+const UNITS_ = [{ suffix: '_c', label: 'Cartons', grp: 'g-ctn' }, { suffix: '_r', label: 'Loose Reams', grp: 'g-ream' }];
+const REG_COLS = UNITS_.flatMap(u => STAGES.map(st => ({ ...st, field: st.key + u.suffix, unit: u })));
+const regVal = (r, col) => (col.blank ? blankZero(r[col.field]) : n(r[col.field]));
 
 const TYPE_LABEL = { OPENING: 'Opening', IN: 'In', OUT: 'Issue', OPEN_CARTON: 'Carton opened' };
 const TYPE_SKIN = {
@@ -115,7 +127,7 @@ const PaperStock = ({ token, notify, currentUser, isAdmin, onUnauthorized }) => 
 const StockTab = ({ items, loaded, call, notify, isAdmin, reload, currentUser }) => {
   const [search, setSearch] = useState('');
   const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState({ brand: '', size: 'A4', gsm: '', reams_per_carton: '5' });
+  const [form, setForm] = useState({ brand: '', size: 'A4', gsm: '', reams_per_carton: '10' });
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(null);   // {id, brand, size, gsm, reams_per_carton, active}
   const [showInactive, setShowInactive] = useState(false);
@@ -550,18 +562,13 @@ const ReportTab = ({ call, notify, currentUser }) => {
       <div class="meta"><span>Date: ${prettyDay(date)}</span><span>Printed by: ${esc(currentUser)}</span></div>
       <table class="reg">
         <thead>
-          <tr><th rowspan="2">Sl.</th><th rowspan="2">Brand / Paper</th><th colspan="2">Opening</th><th colspan="2">In</th><th colspan="2">Sale / Issue</th><th colspan="2">Closing</th></tr>
-          <tr><th>Carton</th><th>Ream</th><th>Carton</th><th>Ream</th><th>Carton</th><th>Ream</th><th>Carton</th><th>Ream</th></tr>
+          <tr><th rowspan="2">Sl.</th><th rowspan="2">Brand / Paper</th>${UNITS_.map(u => `<th colspan="4" class="grp">${u.label}</th>`).join('')}</tr>
+          <tr>${REG_COLS.map((c, i) => `<th class="${i === 4 ? 'split' : ''}">${c.label}</th>`).join('')}</tr>
         </thead>
         <tbody>${shown.map((r, k) => `<tr>
           <td>${k + 1}</td><td class="name">${esc(r.label)}${n(r.opened_c) ? `<small> (${n(r.opened_c)} ctn opened)</small>` : ''}</td>
-          <td>${n(r.open_c)}</td><td>${n(r.open_r)}</td>
-          <td>${blankZero(r.in_c)}</td><td>${blankZero(r.in_r)}</td>
-          <td>${blankZero(r.out_c)}</td><td>${blankZero(r.out_r)}</td>
-          <td class="b">${n(r.close_c)}</td><td class="b">${n(r.close_r)}</td></tr>`).join('')}</tbody>
-        <tfoot><tr><td colspan="2">Total</td>
-          <td>${T('open_c')}</td><td>${T('open_r')}</td><td>${T('in_c')}</td><td>${T('in_r')}</td>
-          <td>${T('out_c')}</td><td>${T('out_r')}</td><td>${T('close_c')}</td><td>${T('close_r')}</td></tr></tfoot>
+          ${REG_COLS.map((c, i) => `<td class="${c.key === 'close' ? 'b' : ''} ${i === 4 ? 'split' : ''}">${regVal(r, c)}</td>`).join('')}</tr>`).join('')}</tbody>
+        <tfoot><tr><td colspan="2">Total</td>${REG_COLS.map((c, i) => `<td class="${i === 4 ? 'split' : ''}">${T(c.field)}</td>`).join('')}</tr></tfoot>
       </table>
       ${entries.filter(e => e.movement_type !== 'OPEN_CARTON').length ? `
       <h3>Entries</h3>
@@ -616,10 +623,9 @@ const ReportTab = ({ call, notify, currentUser }) => {
             <thead>
               <tr>
                 <th rowSpan={2}>Sl.</th><th rowSpan={2}>Brand / Paper</th>
-                <th colSpan={2} className="grp">Opening</th><th colSpan={2} className="grp g-in">In</th>
-                <th colSpan={2} className="grp g-out">Sale / Issue</th><th colSpan={2} className="grp g-close">Closing</th>
+                {UNITS_.map(u => <th key={u.suffix} colSpan={4} className={`grp ${u.grp}`}>{u.label}</th>)}
               </tr>
-              <tr>{Array.from({ length: 4 }).flatMap((_, g) => [<th key={`c${g}`} className="num">Ctn</th>, <th key={`r${g}`} className="num">Ream</th>])}</tr>
+              <tr>{REG_COLS.map((c, i) => <th key={c.field} className={`num ${i === 4 ? 'split' : ''}`}>{c.label}</th>)}</tr>
             </thead>
             <tbody>
               {shown.map((r, k) => (
@@ -629,20 +635,14 @@ const ReportTab = ({ call, notify, currentUser }) => {
                     {r.label}
                     {n(r.opened_c) > 0 && <div style={{ fontSize: 11, color: '#b45309' }}>{n(r.opened_c)} carton opened</div>}
                   </td>
-                  <td className="num">{n(r.open_c)}</td><td className="num">{n(r.open_r)}</td>
-                  <td className="num c-in">{blankZero(r.in_c)}</td><td className="num c-in">{blankZero(r.in_r)}</td>
-                  <td className="num c-out">{blankZero(r.out_c)}</td><td className="num c-out">{blankZero(r.out_r)}</td>
-                  <td className="num c-close">{n(r.close_c)}</td><td className="num c-close">{n(r.close_r)}</td>
+                  {REG_COLS.map((c, i) => <td key={c.field} className={`num ${c.cls} ${i === 4 ? 'split' : ''}`}>{regVal(r, c)}</td>)}
                 </tr>
               ))}
             </tbody>
             <tfoot>
               <tr>
                 <td colSpan={2}>Total</td>
-                <td className="num">{T('open_c')}</td><td className="num">{T('open_r')}</td>
-                <td className="num">{T('in_c')}</td><td className="num">{T('in_r')}</td>
-                <td className="num">{T('out_c')}</td><td className="num">{T('out_r')}</td>
-                <td className="num">{T('close_c')}</td><td className="num">{T('close_r')}</td>
+                {REG_COLS.map((c, i) => <td key={c.field} className={`num ${i === 4 ? 'split' : ''}`}>{T(c.field)}</td>)}
               </tr>
             </tfoot>
           </table>
@@ -668,6 +668,7 @@ const openPrint = (title, body) => {
     td.num, th.num, table.reg td { text-align: right; }
     table.reg th { text-align: center; } table.reg td.name, table.reg td:first-child { text-align: left; }
     td.b { font-weight: bold; } small { color: #666; }
+    table.reg .split { border-left: 2.5px solid #333; }
     tfoot td { font-weight: bold; background: #f5f5f5; }
     .sign { margin-top: 44px; display: flex; justify-content: space-between; font-size: 12px; }
     .sign div { border-top: 1px solid #333; padding-top: 4px; width: 170px; text-align: center; }
@@ -699,36 +700,38 @@ const drawReportPage = (rows, pageIdx, pageCount, date, startIdx) => new Promise
   x.fillText(prettyDay(date), W - pad, 62);
   if (pageCount > 1) { x.font = 'bold 22px Arial'; x.fillText(`Page ${pageIdx + 1} of ${pageCount}`, W - pad, 100); }
 
-  // columns: name, then 4 groups of (C, R)
-  const nameW = 360, grpW = (W - pad * 2 - nameW) / 4, cellW = grpW / 2;
-  const groups = [['Opening', '#334155'], ['In', '#15803d'], ['Issue', '#c2410c'], ['Closing', '#4338ca']];
+  // columns: name, then the four carton figures, then the four ream figures
+  const nameW = 330, blockW = (W - pad * 2 - nameW) / 2, cellW = blockW / 4;
+  const colX = (i) => pad + nameW + (i >= 4 ? blockW : 0) + (i % 4) * cellW + cellW / 2;
   let y = headH;
   x.fillStyle = '#eef2ff'; x.fillRect(0, y, W, colH);
   x.textAlign = 'left'; x.fillStyle = '#334155'; x.font = 'bold 22px Arial';
   x.fillText('Paper', pad, y + 44);
-  groups.forEach(([g, col], k) => {
-    const gx = pad + nameW + k * grpW;
-    x.textAlign = 'center'; x.fillStyle = col; x.font = 'bold 22px Arial';
-    x.fillText(g, gx + grpW / 2, y + 28);
-    x.font = 'bold 17px Arial'; x.fillStyle = '#64748b';
-    x.fillText('Ctn', gx + cellW / 2, y + 56); x.fillText('Ream', gx + cellW * 1.5, y + 56);
+  UNITS_.forEach((u, k) => {
+    x.textAlign = 'center'; x.fillStyle = '#1e293b'; x.font = 'bold 22px Arial';
+    x.fillText(u.label, pad + nameW + k * blockW + blockW / 2, y + 28);
   });
+  REG_COLS.forEach((c, i) => {
+    x.textAlign = 'center'; x.fillStyle = c.color; x.font = 'bold 17px Arial';
+    x.fillText(c.label, colX(i), y + 58);
+  });
+  const splitX = pad + nameW + blockW - 4;
   y += colH;
   rows.forEach((r, k) => {
     const hot = +r.moves_today > 0;
     if (hot) { x.fillStyle = '#fffbeb'; x.fillRect(0, y, W, rowH); }
     x.textAlign = 'left'; x.fillStyle = '#0f172a'; x.font = `${hot ? 'bold ' : ''}23px Arial`;
-    x.fillText(`${startIdx + k + 1}. ${r.label}`.substring(0, 28), pad, y + 35);
-    const vals = [[n(r.open_c), n(r.open_r)], [blankZero(r.in_c), blankZero(r.in_r)], [blankZero(r.out_c), blankZero(r.out_r)], [n(r.close_c), n(r.close_r)]];
-    vals.forEach(([cv, rv], g) => {
-      const gx = pad + nameW + g * grpW;
-      x.textAlign = 'center'; x.fillStyle = groups[g][1]; x.font = `${g === 3 ? 'bold ' : ''}25px Arial`;
-      x.fillText(String(cv), gx + cellW / 2, y + 36); x.fillText(String(rv), gx + cellW * 1.5, y + 36);
+    x.fillText(`${startIdx + k + 1}. ${r.label}`.substring(0, 25), pad, y + 35);
+    REG_COLS.forEach((c, i) => {
+      x.textAlign = 'center'; x.fillStyle = c.color; x.font = `${c.key === 'close' ? 'bold ' : ''}25px Arial`;
+      x.fillText(String(regVal(r, c)), colX(i), y + 36);
     });
     x.strokeStyle = '#e2e8f0'; x.lineWidth = 1.5;
     x.beginPath(); x.moveTo(pad, y + rowH); x.lineTo(W - pad, y + rowH); x.stroke();
     y += rowH;
   });
+  x.strokeStyle = '#94a3b8'; x.lineWidth = 3;
+  x.beginPath(); x.moveTo(splitX, headH); x.lineTo(splitX, y); x.stroke();
   x.textAlign = 'left'; x.fillStyle = '#94a3b8'; x.font = '20px Arial';
   x.fillText('Generated by Inventory Hub • stock.gpci.in', pad, H - 22);
   c.toBlob(b => resolve(new File([b], `paper-stock-${date}-p${pageIdx + 1}.png`, { type: 'image/png' })), 'image/png');

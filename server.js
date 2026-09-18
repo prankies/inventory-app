@@ -380,7 +380,7 @@ const initPaperDB = async () => {
       size TEXT NOT NULL,
       gsm REAL NOT NULL DEFAULT 0,
       sort_order INTEGER DEFAULT 0,
-      reams_per_carton INTEGER DEFAULT 5,
+      reams_per_carton INTEGER DEFAULT 10,
       active BOOLEAN DEFAULT TRUE,
       created_by TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
@@ -1504,7 +1504,7 @@ app.post('/api/paper/items', auth, async (req, res) => {
       const size = String(it.size || '').trim().toUpperCase();
       if (!brand || !size) throw Object.assign(new Error('Brand and size are required'), { status: 400 });
       const gsm = num(it.gsm);
-      const rpc = Math.max(0, Math.round(num(it.reams_per_carton === undefined ? 5 : it.reams_per_carton)));
+      const rpc = Math.max(0, Math.round(num(it.reams_per_carton === undefined ? 10 : it.reams_per_carton)));
       const { rows: [row] } = await client.query(
         `INSERT INTO paper_items (brand, size, gsm, reams_per_carton, sort_order, created_by)
          VALUES ($1,$2,$3,$4,$5,$6)
