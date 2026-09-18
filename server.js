@@ -361,8 +361,66 @@ const initDB = async () => {
     }
   } catch (e) { console.error('Date normalisation failed:', e.message); }
 
-  console.log('Database ready - v2.3');
+  await initPaperDB();
+
+  console.log('Database ready - v2.4');
 };
+
+// ---- Photocopier paper -------------------------------------------------------
+// Paper is counted in two independent quantities -- full cartons and loose
+// reams -- so it cannot share the single-quantity inventory table. Stock is
+// never stored: it is the sum of the non-voided movements, so it cannot drift
+// away from the history that explains it. Quantities on a movement are signed
+// deltas (receipts positive, issues negative).
+const initPaperDB = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS paper_items (
+      id SERIAL PRIMARY KEY,
+      brand TEXT NOT NULL,
+      size TEXT NOT NULL,
+      gsm REAL NOT NULL DEFAULT 0,
+      sort_order INTEGER DEFAULT 0,
+      reams_per_carton INTEGER DEFAULT 5,
+      active BOOLEAN DEFAULT TRUE,
+      created_by TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS paper_items_uniq ON paper_items (LOWER(brand), LOWER(size), gsm);
+    CREATE TABLE IF NOT EXISTS paper_movements (
+      id SERIAL PRIMARY KEY,
+      item_id INTEGER NOT NULL REFERENCES paper_items(id),
+      movement_type TEXT NOT NULL,
+      cartons REAL NOT NULL DEFAULT 0,
+      reams REAL NOT NULL DEFAULT 0,
+      party TEXT DEFAULT '',
+      reference TEXT DEFAULT '',
+      remarks TEXT DEFAULT '',
+      entry_date TEXT NOT NULL,
+      batch_id TEXT,
+      parent_id INTEGER,
+      action_by TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      voided BOOLEAN DEFAULT FALSE,
+      voided_by TEXT,
+      voided_at TIMESTAMPTZ,
+      void_reason TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_paper_mv_item ON paper_movements (item_id, entry_date);
+    CREATE INDEX IF NOT EXISTS idx_paper_mv_date ON paper_movements (entry_date);
+    CREATE INDEX IF NOT EXISTS idx_paper_mv_parent ON paper_movements (parent_id);
+  `);
+};
+
+const num = (v) => { const n = parseFloat(v); return isFinite(n) ? +n.toFixed(3) : 0; };
+
+const paperStock = async (client, itemId) => {
+  const { rows: [s] } = await client.query(
+    `SELECT COALESCE(SUM(cartons), 0) AS cartons, COALESCE(SUM(reams), 0) AS reams
+     FROM paper_movements WHERE item_id = $1 AND NOT voided`, [itemId]);
+  return { cartons: +(+s.cartons).toFixed(3), reams: +(+s.reams).toFixed(3) };
+};
+
+const paperLabel = (it) => `${it.brand} ${it.size}${it.gsm ? ` ${it.gsm} GSM` : ''}`;
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -1412,6 +1470,227 @@ app.post('/api/movements/void-batch', auth, async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(400).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ---- Photocopier paper routes -----------------------------------------------
+const PAPER_STOCK_SQL = `
+  SELECT p.*,
+    COALESCE(SUM(m.cartons), 0)::float AS cartons,
+    COALESCE(SUM(m.reams), 0)::float   AS reams
+  FROM paper_items p
+  LEFT JOIN paper_movements m ON m.item_id = p.id AND NOT m.voided
+  GROUP BY p.id
+  ORDER BY p.sort_order, p.id`;
+
+app.get('/api/paper/items', auth, async (req, res) => {
+  const { rows } = await pool.query(PAPER_STOCK_SQL);
+  res.json(rows.map(r => ({ ...r, label: paperLabel(r) })));
+});
+
+// Accepts one item or { items: [...] } so the register's list can be added in one go.
+app.post('/api/paper/items', auth, async (req, res) => {
+  const list = Array.isArray(req.body?.items) ? req.body.items : [req.body || {}];
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: [{ max }] } = await client.query('SELECT COALESCE(MAX(sort_order), 0) AS max FROM paper_items');
+    let order = max;
+    const created = [];
+    for (const it of list) {
+      const brand = String(it.brand || '').trim();
+      const size = String(it.size || '').trim().toUpperCase();
+      if (!brand || !size) throw Object.assign(new Error('Brand and size are required'), { status: 400 });
+      const gsm = num(it.gsm);
+      const rpc = Math.max(0, Math.round(num(it.reams_per_carton === undefined ? 5 : it.reams_per_carton)));
+      const { rows: [row] } = await client.query(
+        `INSERT INTO paper_items (brand, size, gsm, reams_per_carton, sort_order, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (LOWER(brand), LOWER(size), gsm) DO NOTHING RETURNING *`,
+        [brand, size, gsm, rpc, ++order, req.user.email]);
+      if (!row && list.length === 1) {
+        throw Object.assign(new Error(`${paperLabel({ brand, size, gsm })} is already in the list`), { status: 400 });
+      }
+      if (row) created.push(row);
+    }
+    await client.query('COMMIT');
+    res.json({ created: created.length, items: created });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(err.status || 500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.put('/api/paper/items/:id', auth, requireAdmin, async (req, res) => {
+  const b = req.body || {};
+  const brand = String(b.brand || '').trim();
+  const size = String(b.size || '').trim().toUpperCase();
+  if (!brand || !size) return res.status(400).json({ error: 'Brand and size are required' });
+  try {
+    const { rows: [row] } = await pool.query(
+      `UPDATE paper_items SET brand=$1, size=$2, gsm=$3, reams_per_carton=$4,
+         active=$5, sort_order=COALESCE($6, sort_order)
+       WHERE id=$7 RETURNING *`,
+      [brand, size, num(b.gsm), Math.max(0, Math.round(num(b.reams_per_carton))),
+       b.active !== false, b.sort_order === undefined ? null : Math.round(num(b.sort_order)), req.params.id]);
+    if (!row) return res.status(404).json({ error: 'Paper not found' });
+    res.json(row);
+  } catch (e) {
+    res.status(400).json({ error: 'Another paper already has that brand, size and GSM' });
+  }
+});
+
+// One entry screen posts a whole challan: several papers, same date and party.
+// kind = OPENING | IN | OUT. An issue needing more loose reams than are on the
+// shelf opens full cartons automatically -- that is what happens physically --
+// and records it as an OPEN_CARTON row tied to the issue, so voiding the issue
+// puts the carton back too.
+app.post('/api/paper/movements', auth, async (req, res) => {
+  const { kind, entry_date, party, reference, remarks, lines } = req.body || {};
+  if (!['OPENING', 'IN', 'OUT'].includes(kind)) return res.status(400).json({ error: 'Unknown entry type' });
+  if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: 'Add at least one paper' });
+  const today = istDate();
+  const date = IST_DATE_RE.test(entry_date || '') ? entry_date : today;
+  if (date > today) return res.status(400).json({ error: 'The date cannot be in the future' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const ids = [...new Set(lines.map(l => parseInt(l.item_id)))];
+    const { rows: items } = await client.query(
+      'SELECT * FROM paper_items WHERE id = ANY($1) ORDER BY id FOR UPDATE', [ids]);
+    const byId = new Map(items.map(i => [i.id, i]));
+    const batch = crypto.randomBytes(8).toString('hex');
+    const common = [String(party || '').trim(), String(reference || '').trim(), String(remarks || '').trim(), date, batch, req.user.email];
+    const insert = (itemId, type, c, r, parentId, note) => client.query(
+      `INSERT INTO paper_movements (item_id, movement_type, cartons, reams, party, reference, remarks, entry_date, batch_id, action_by, parent_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+      [itemId, type, c, r, common[0], common[1], note ?? common[2], common[3], common[4], common[5], parentId || null]);
+
+    let saved = 0, opened = [];
+    for (const l of lines) {
+      const it = byId.get(parseInt(l.item_id));
+      if (!it) throw Object.assign(new Error('One of the papers no longer exists'), { status: 400 });
+      const c = num(l.cartons), r = num(l.reams);
+      if (c < 0 || r < 0) throw Object.assign(new Error(`${paperLabel(it)}: quantities cannot be negative`), { status: 400 });
+      if (!c && !r) continue;
+
+      if (kind === 'OPENING') {
+        const { rowCount } = await client.query(
+          `SELECT 1 FROM paper_movements WHERE item_id=$1 AND movement_type='OPENING' AND NOT voided`, [it.id]);
+        if (rowCount) throw Object.assign(new Error(
+          `${paperLabel(it)} already has an opening stock. Void that entry first if it was wrong.`), { status: 400 });
+      }
+
+      if (kind !== 'OUT') {
+        await insert(it.id, kind, c, r);
+        saved++;
+        continue;
+      }
+
+      const stock = await paperStock(client, it.id);
+      let open = 0;
+      if (r > stock.reams) {
+        if (!it.reams_per_carton) throw Object.assign(new Error(
+          `${paperLabel(it)}: only ${stock.reams} loose ream(s). Set reams per carton so a carton can be opened.`), { status: 400 });
+        open = Math.ceil((r - stock.reams) / it.reams_per_carton);
+      }
+      if (c + open > stock.cartons) {
+        throw Object.assign(new Error(
+          `${paperLabel(it)}: only ${stock.cartons} carton(s) + ${stock.reams} ream(s) in stock`), { status: 400 });
+      }
+      const { rows: [out] } = await insert(it.id, 'OUT', -c, -r);
+      if (open) {
+        await insert(it.id, 'OPEN_CARTON', -open, open * it.reams_per_carton, out.id,
+          `Opened ${open} carton(s) for issue`);
+        opened.push(`${open} carton(s) of ${paperLabel(it)}`);
+      }
+      saved++;
+    }
+    if (!saved) throw Object.assign(new Error('Enter a carton or ream quantity'), { status: 400 });
+    await client.query('COMMIT');
+    res.json({ saved, opened, batch_id: batch });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(err.status || 500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/paper/movements', auth, async (req, res) => {
+  const date = IST_DATE_RE.test(req.query.date || '') ? req.query.date : istDate();
+  const { rows } = await pool.query(
+    `SELECT m.*, p.brand, p.size, p.gsm
+     FROM paper_movements m JOIN paper_items p ON p.id = m.item_id
+     WHERE m.entry_date = $1
+     ORDER BY m.id DESC`, [date]);
+  res.json(rows.map(r => ({ ...r, label: paperLabel(r) })));
+});
+
+// The register for one day: every paper's opening, in, issue and closing. An
+// opening-stock entry made on the day itself counts as opening, not as a receipt.
+app.get('/api/paper/report', auth, async (req, res) => {
+  const date = IST_DATE_RE.test(req.query.date || '') ? req.query.date : istDate();
+  const { rows } = await pool.query(
+    `SELECT p.id, p.brand, p.size, p.gsm, p.reams_per_carton, p.active, p.sort_order,
+       COALESCE(SUM(m.cartons) FILTER (WHERE m.entry_date < $1 OR m.movement_type = 'OPENING'), 0)::float AS open_c,
+       COALESCE(SUM(m.reams)   FILTER (WHERE m.entry_date < $1 OR m.movement_type = 'OPENING'), 0)::float AS open_r,
+       COALESCE(SUM(m.cartons) FILTER (WHERE m.entry_date = $1 AND m.movement_type = 'IN'), 0)::float AS in_c,
+       COALESCE(SUM(m.reams)   FILTER (WHERE m.entry_date = $1 AND m.movement_type = 'IN'), 0)::float AS in_r,
+       COALESCE(-SUM(m.cartons) FILTER (WHERE m.entry_date = $1 AND m.movement_type = 'OUT'), 0)::float AS out_c,
+       COALESCE(-SUM(m.reams)   FILTER (WHERE m.entry_date = $1 AND m.movement_type = 'OUT'), 0)::float AS out_r,
+       COALESCE(-SUM(m.cartons) FILTER (WHERE m.entry_date = $1 AND m.movement_type = 'OPEN_CARTON'), 0)::float AS opened_c,
+       COALESCE(SUM(m.cartons), 0)::float AS close_c,
+       COALESCE(SUM(m.reams), 0)::float   AS close_r,
+       COUNT(m.id) FILTER (WHERE m.entry_date = $1) AS moves_today
+     FROM paper_items p
+     LEFT JOIN paper_movements m ON m.item_id = p.id AND NOT m.voided AND m.entry_date <= $1
+     GROUP BY p.id
+     ORDER BY p.sort_order, p.id`, [date]);
+  res.json({
+    date,
+    items: rows
+      .filter(r => r.active || +r.moves_today > 0 || r.close_c || r.close_r)
+      .map(r => ({ ...r, label: paperLabel(r) })),
+  });
+});
+
+// Whoever entered it can void it the same day; an owner can void any entry.
+// Voiding an issue also voids the carton it opened. Stock may never end up
+// negative, which catches voiding a receipt whose paper has already gone out.
+app.post('/api/paper/movements/:id/void', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: [row] } = await client.query(
+      `SELECT m.*, (m.created_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date AS today
+       FROM paper_movements m WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!row) throw Object.assign(new Error('That entry no longer exists'), { status: 404 });
+    if (row.voided) throw Object.assign(new Error('That entry is already voided'), { status: 400 });
+    if (row.parent_id) throw Object.assign(new Error('This carton was opened for an issue -- void the issue instead'), { status: 400 });
+    if (req.user.role !== 'admin' && (row.action_by !== req.user.email || !row.today)) {
+      throw Object.assign(new Error('Only the person who entered this, on the same day, or an owner can void it'), { status: 403 });
+    }
+    await client.query('SELECT id FROM paper_items WHERE id = $1 FOR UPDATE', [row.item_id]);
+    const { rowCount } = await client.query(
+      `UPDATE paper_movements SET voided = TRUE, voided_by = $1, voided_at = NOW(), void_reason = $2
+       WHERE (id = $3 OR parent_id = $3) AND NOT voided`,
+      [req.user.email, String(req.body?.reason || '').trim() || null, row.id]);
+    const stock = await paperStock(client, row.item_id);
+    if (stock.cartons < 0 || stock.reams < 0) {
+      throw Object.assign(new Error(
+        'Voiding this would leave negative stock -- the paper has already been issued. Void the later issue first.'), { status: 409 });
+    }
+    await client.query('COMMIT');
+    res.json({ voided: rowCount, stock });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(err.status || 500).json({ error: err.message });
   } finally {
     client.release();
   }

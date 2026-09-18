@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import PaperStock from './PaperStock';
 
 const API = '/api';
 const UNITS = ['pcs','kg','g','ton','ltr','ml','box','bundle','ream','roll','sheet','packet','bag','bottle','pair','set','nos','mtr','ft','inch'];
@@ -16,6 +17,8 @@ const InventoryApp = () => {
   const [currentUser, setCurrentUser] = useState(null);
   const [currentRole, setCurrentRole] = useState('staff');
   const [toasts, setToasts] = useState([]);
+  // The paper register is its own page, reachable directly at stock.gpci.in/#paper.
+  const [page, setPage] = useState(() => (window.location.hash === '#paper' ? 'paper' : 'main'));
   const isAdmin = currentRole === 'admin';
   const [token, setToken] = useState(null);
   const [email, setEmail] = useState('');
@@ -292,8 +295,20 @@ const InventoryApp = () => {
     notify(`Verification saved — ${data.items_counted} counted, ${data.items_adjusted} corrected, net change ${data.net_change > 0 ? '+' : ''}${data.net_change}.`, 'success');
   };
 
+  const goPage = (p) => {
+    setPage(p);
+    window.history.replaceState(null, '', p === 'paper' ? '#paper' : window.location.pathname);
+  };
+
+  useEffect(() => {
+    const onHash = () => setPage(window.location.hash === '#paper' ? 'paper' : 'main');
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+
   // Accordion: opening one tool panel closes the others so they don't stack
   const togglePanel = (name) => {
+    if (page !== 'main') goPage('main');
     const state = {
       master: showMasterImport, issue: showIssueSlip, transfer: showTransfer,
       upload: showUpload, import: showImport, ledger: showLedger,
@@ -1002,20 +1017,26 @@ const InventoryApp = () => {
           </div>
         </div>
         <div className="header-btns">
-          <button className={`nav-btn ${showDaily?'active':''}`} onClick={()=>togglePanel('daily')}>📅 Daily Receipts</button>
-          <button className={`nav-btn ${showMasterImport?'active':''}`} onClick={()=>togglePanel('master')}>📚 Item Master</button>
-          <button className={`nav-btn ${showIssueSlip?'active':''}`} onClick={()=>togglePanel('issue')}>📋 Issue Slip</button>
-          <button className={`nav-btn ${showTransfer?'active':''}`} onClick={()=>togglePanel('transfer')}>🔄 Transfer</button>
-          <button className={`nav-btn ${showUpload?'active':''}`} onClick={()=>togglePanel('upload')}>📤 Upload Bill</button>
-          <button className={`nav-btn ${showImport?'active':''}`} onClick={()=>togglePanel('import')}>📊 Import CSV/XLS</button>
-          <button className={`nav-btn ${showVerify?'active':''}`} onClick={()=>togglePanel('verify')}>✅ Verify Stock</button>
-          <button className={`nav-btn ${showLedger?'active':''}`} onClick={()=>togglePanel('ledger')}>📒 Ledger</button>
-          {isAdmin && <button className={`nav-btn ${editingGodowns?'active':''}`} onClick={()=>togglePanel('godowns')}>🏭 Godowns</button>}
+          <button className={`nav-btn ${page==='paper'?'active':''}`} onClick={()=>goPage(page==='paper'?'main':'paper')}>📄 Paper Stock</button>
+          <button className={`nav-btn ${page==='main'&&showDaily?'active':''}`} onClick={()=>togglePanel('daily')}>📅 Daily Receipts</button>
+          <button className={`nav-btn ${page==='main'&&showMasterImport?'active':''}`} onClick={()=>togglePanel('master')}>📚 Item Master</button>
+          <button className={`nav-btn ${page==='main'&&showIssueSlip?'active':''}`} onClick={()=>togglePanel('issue')}>📋 Issue Slip</button>
+          <button className={`nav-btn ${page==='main'&&showTransfer?'active':''}`} onClick={()=>togglePanel('transfer')}>🔄 Transfer</button>
+          <button className={`nav-btn ${page==='main'&&showUpload?'active':''}`} onClick={()=>togglePanel('upload')}>📤 Upload Bill</button>
+          <button className={`nav-btn ${page==='main'&&showImport?'active':''}`} onClick={()=>togglePanel('import')}>📊 Import CSV/XLS</button>
+          <button className={`nav-btn ${page==='main'&&showVerify?'active':''}`} onClick={()=>togglePanel('verify')}>✅ Verify Stock</button>
+          <button className={`nav-btn ${page==='main'&&showLedger?'active':''}`} onClick={()=>togglePanel('ledger')}>📒 Ledger</button>
+          {isAdmin && <button className={`nav-btn ${page==='main'&&editingGodowns?'active':''}`} onClick={()=>togglePanel('godowns')}>🏭 Godowns</button>}
           <button className="nav-btn danger" onClick={handleLogout}>🚪 Sign Out</button>
         </div>
       </div>
 
       <div className="main">
+        {page === 'paper' && (
+          <PaperStock token={token} notify={notify} currentUser={currentUser} isAdmin={isAdmin}
+            onUnauthorized={() => signOutLocal('Your session has expired. Please sign in again.')} />
+        )}
+        {page === 'main' && <>
 
         {/* KPI summary */}
         <div className="stat-row">
@@ -2229,6 +2250,7 @@ const InventoryApp = () => {
         <div className="footer">
           Total items: <strong>{inventory.length}</strong> &nbsp;|&nbsp; Total units: <strong>{inventory.reduce((s,i)=>s+i.quantity,0)}</strong>
         </div>
+        </>}
       </div>
     </div>
   );

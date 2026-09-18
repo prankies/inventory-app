@@ -260,3 +260,36 @@ tbody tr:hover td { background: var(--primary-50); }
   .search-wrap { min-width: 120px; }
   th, td { padding: 9px 10px; font-size: 12px; }
 }
+
+/* ============ Paper stock page ============ */
+.paper-tabs { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 6px; box-shadow: var(--shadow-sm); }
+.paper-tabs .mode-tab { white-space: nowrap; }
+.paper-add-row { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr auto; gap: 10px; align-items: end; }
+.paper-head-row { display: grid; grid-template-columns: 170px 1fr 1fr 1fr; gap: 10px; }
+.paper-note { padding: 8px 12px; border-radius: 8px; font-size: 13px; font-weight: 600; margin-bottom: 12px; }
+.paper-note.amber { background: #fff7ed; color: #b45309; border: 1px solid #fed7aa; }
+.paper-empty { text-align: center; padding: 22px; color: var(--text-3); background: var(--surface-2); border-radius: 10px; border: 1.5px dashed #cbd5e1; }
+.paper-table th.num, .paper-table td.num { text-align: right; }
+.paper-table td { padding: 9px 12px; }
+.paper-table .qty-in { margin-bottom: 0; width: 84px; text-align: right; padding: 7px 9px; }
+.paper-table tr.row-filled td { background: #f0fdf4 !important; }
+.paper-table tr.row-short td { background: #fef2f2 !important; }
+.paper-table .pill { padding: 2px 9px; border-radius: 20px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+.paper-table tfoot td { font-weight: 800; color: var(--text); background: var(--surface-2); border-top: 2px solid var(--border-strong); }
+.register th.grp { text-align: center; border-bottom: none; color: var(--text-2); }
+.register th.g-in { color: #15803d; } .register th.g-out { color: #c2410c; } .register th.g-close { color: var(--primary-600); }
+.register td.c-in { color: #15803d; font-weight: 700; }
+.register td.c-out { color: #c2410c; font-weight: 700; }
+.register td.c-close { color: var(--primary-700); font-weight: 800; }
+.register tr.row-moved td { background: #fffbeb; }
+.register td:nth-child(2n+3), .register th.grp { border-left: 1px solid var(--border); }
+@media (max-width: 640px) {
+  .paper-add-row, .paper-head-row { grid-template-columns: 1fr 1fr; }
+  .paper-tabs { overflow-x: auto; }
+  .paper-tabs .mode-tab { padding: 9px 10px; font-size: 12px; }
+  .paper-table .qty-in { width: 50px; padding: 7px 5px; }
+  .paper-table td, .paper-table th { padding: 7px 5px; }
+  .paper-table td:first-child, .paper-table th:first-child { padding-left: 8px; }
+  .paper-entry-card { padding: 14px 10px; }
+  .register td:nth-child(2) { white-space: normal !important; min-width: 110px; }
+}
