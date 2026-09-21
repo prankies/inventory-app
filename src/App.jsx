@@ -339,6 +339,14 @@ const InventoryApp = () => {
     if (savedToken && savedUser) {
       setToken(savedToken); setCurrentUser(savedUser);
       setCurrentRole(localStorage.getItem('inv_role') || 'staff');
+      fetch(`${API}/me`, { headers: { Authorization: savedToken } })
+        .then(r => (r.ok ? r.json() : null))
+        .then(me => {
+          if (!me?.role) return;
+          setCurrentRole(me.role);
+          localStorage.setItem('inv_role', me.role);
+        })
+        .catch(() => {});
       loadInventory(savedToken); loadGodowns(savedToken); loadCategories(savedToken);
     }
   }, [loadInventory, loadGodowns, loadCategories]);

@@ -182,6 +182,7 @@ const StockTab = ({ items, loaded, call, notify, isAdmin, reload, currentUser })
 
   return (
     <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+      <datalist id="paper-sizes">{SIZES.map(sz => <option key={sz} value={sz} />)}</datalist>
       <div style={{ padding: '16px 20px', display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', borderBottom: '1px solid var(--border)' }}>
         <input className="input" style={{ marginBottom: 0, flex: '1 1 200px' }} placeholder="🔍 Search brand, size or GSM"
           value={search} onChange={e => setSearch(e.target.value)} />
@@ -201,7 +202,6 @@ const StockTab = ({ items, loaded, call, notify, isAdmin, reload, currentUser })
               <label className="field-label">Size *</label>
               <input className="input" style={{ marginBottom: 0 }} list="paper-sizes" value={form.size}
                 onChange={e => setForm({ ...form, size: e.target.value })} />
-              <datalist id="paper-sizes">{SIZES.map(s => <option key={s} value={s} />)}</datalist>
             </div>
             <div>
               <label className="field-label">GSM</label>
@@ -233,54 +233,71 @@ const StockTab = ({ items, loaded, call, notify, isAdmin, reload, currentUser })
         </div>
       )}
 
+      {editing && (
+        <div style={{ padding: '16px 20px', background: '#eef2ff', borderBottom: '1px solid var(--border)' }}>
+          <div style={{ fontWeight: 700, marginBottom: 10 }}>Edit {editing.label}</div>
+          <div className="paper-add-row">
+            <div>
+              <label className="field-label">Brand</label>
+              <input className="input" style={{ marginBottom: 0 }} value={editing.brand}
+                onChange={e => setEditing({ ...editing, brand: e.target.value })} />
+            </div>
+            <div>
+              <label className="field-label">Size</label>
+              <input className="input" style={{ marginBottom: 0 }} list="paper-sizes" value={editing.size}
+                onChange={e => setEditing({ ...editing, size: e.target.value })} />
+            </div>
+            <div>
+              <label className="field-label">GSM</label>
+              <input className="input" style={{ marginBottom: 0 }} type="number" min="0" placeholder="optional" value={editing.gsm}
+                onChange={e => setEditing({ ...editing, gsm: e.target.value })} />
+            </div>
+            <div>
+              <label className="field-label">Reams / Carton</label>
+              <input className="input" style={{ marginBottom: 0 }} type="number" min="0" autoFocus value={editing.reams_per_carton}
+                onChange={e => setEditing({ ...editing, reams_per_carton: e.target.value })} />
+            </div>
+          </div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, margin: '10px 0' }}>
+            <input type="checkbox" checked={editing.active} onChange={e => setEditing({ ...editing, active: e.target.checked })} />
+            In use (untick to hide a paper you no longer stock)
+          </label>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn btn-green" disabled={busy} onClick={saveEdit}>{busy ? 'Saving…' : 'Save'}</button>
+            <button className="btn btn-light" onClick={() => setEditing(null)}>Cancel</button>
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 8 }}>
+            Changing reams per carton does not alter stock already counted; it applies to cartons opened from now on.
+          </div>
+        </div>
+      )}
+
       {rows.length > 0 && (
         <div className="table-wrap">
           <table className="paper-table">
             <thead><tr>
               <th>Sl.</th><th>Brand / Paper</th><th className="num">Reams/Ctn</th>
               <th className="num">Cartons</th><th className="num">Loose Reams</th>
-              {isAdmin && <th></th>}
             </tr></thead>
             <tbody>
-              {rows.map((i, k) => editing && editing.id === i.id ? (
-                <tr key={i.id}>
-                  <td>{k + 1}</td>
-                  <td colSpan={2}>
-                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                      <input className="input" style={{ marginBottom: 0, width: 130, padding: '5px 8px' }} value={editing.brand}
-                        onChange={e => setEditing({ ...editing, brand: e.target.value })} />
-                      <input className="input" style={{ marginBottom: 0, width: 70, padding: '5px 8px' }} list="paper-sizes" value={editing.size}
-                        onChange={e => setEditing({ ...editing, size: e.target.value })} />
-                      <input className="input" style={{ marginBottom: 0, width: 70, padding: '5px 8px' }} type="number" placeholder="GSM" value={editing.gsm || ''}
-                        onChange={e => setEditing({ ...editing, gsm: e.target.value })} />
-                      <input className="input" style={{ marginBottom: 0, width: 70, padding: '5px 8px' }} type="number" title="Reams per carton" value={editing.reams_per_carton}
-                        onChange={e => setEditing({ ...editing, reams_per_carton: e.target.value })} />
-                      <label style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12 }}>
-                        <input type="checkbox" checked={editing.active} onChange={e => setEditing({ ...editing, active: e.target.checked })} /> In use
-                      </label>
-                    </div>
-                  </td>
-                  <td className="num">{n(i.cartons)}</td>
-                  <td className="num">{n(i.reams)}</td>
-                  <td style={{ whiteSpace: 'nowrap', textAlign: 'right' }}>
-                    <button className="btn btn-green btn-sm" disabled={busy} onClick={saveEdit}>Save</button>{' '}
-                    <button className="btn btn-light btn-sm" onClick={() => setEditing(null)}>Cancel</button>
-                  </td>
-                </tr>
-              ) : (
+              {rows.map((i, k) => (
                 <tr key={i.id} style={i.active ? undefined : { opacity: .5 }}>
                   <td style={{ color: 'var(--text-3)' }}>{k + 1}</td>
-                  <td style={{ fontWeight: 600, color: 'var(--text)' }}>{i.label}{!i.active && ' (not in use)'}</td>
+                  <td style={{ fontWeight: 600, color: 'var(--text)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'space-between' }}>
+                      <span>{i.label}{!i.active && ' (not in use)'}</span>
+                      {isAdmin && (
+                        <button className="btn btn-light btn-sm" title="Edit this paper" style={{ flexShrink: 0 }}
+                          onClick={() => setEditing({
+                            id: i.id, label: i.label, brand: i.brand, size: i.size, gsm: i.gsm || '',
+                            reams_per_carton: i.reams_per_carton, active: i.active,
+                          })}>✎ Edit</button>
+                      )}
+                    </div>
+                  </td>
                   <td className="num" style={{ color: 'var(--text-3)' }}>{i.reams_per_carton || '-'}</td>
                   <td className="num"><span className="badge">{n(i.cartons)}</span></td>
                   <td className="num" style={{ fontWeight: 700 }}>{n(i.reams)}</td>
-                  {isAdmin && (
-                    <td style={{ textAlign: 'right' }}>
-                      <button className="btn btn-light btn-sm" title="Edit" onClick={() => setEditing({
-                        id: i.id, brand: i.brand, size: i.size, gsm: i.gsm, reams_per_carton: i.reams_per_carton, active: i.active,
-                      })}>&#9998;</button>
-                    </td>
-                  )}
                 </tr>
               ))}
             </tbody>

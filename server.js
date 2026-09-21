@@ -563,6 +563,11 @@ app.post('/api/change-password', auth, async (req, res) => {
   res.json({ message: 'Password changed' });
 });
 
+// Who the signed-in account is. The client caches the role at sign-in, so it
+// re-reads it here on load -- otherwise a role change never reaches a device
+// that stays signed in.
+app.get('/api/me', auth, (req, res) => res.json(req.user));
+
 app.post('/api/logout', auth, async (req, res) => {
   await pool.query('DELETE FROM sessions WHERE token = $1', [req.headers['authorization']]);
   res.json({ message: 'Logged out' });
