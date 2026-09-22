@@ -132,8 +132,31 @@ const StockTab = ({ items, loaded, call, notify, isAdmin, reload, currentUser })
   const [editing, setEditing] = useState(null);   // {id, brand, size, gsm, reams_per_carton, active}
   const [showInactive, setShowInactive] = useState(false);
 
+  const [fBrand, setFBrand] = useState('');
+  const [fSize, setFSize] = useState('');
+  const [fGsm, setFGsm] = useState('');
+  const [sortBy, setSortBy] = useState('register');
+
   const q = search.trim().toLowerCase();
-  const rows = items.filter(i => (showInactive || i.active) && (!q || i.label.toLowerCase().includes(q)));
+  const pool = items.filter(i => showInactive || i.active);
+  const uniq = (vals) => [...new Set(vals)];
+  const brands = uniq(pool.map(i => i.brand)).sort((a, b) => a.localeCompare(b));
+  const sizes = uniq(pool.map(i => i.size)).sort((a, b) => a.localeCompare(b));
+  const gsms = uniq(pool.map(i => n(i.gsm))).sort((a, b) => a - b);
+  const byText = (k) => (a, b) => String(a[k]).localeCompare(String(b[k]));
+  const SORTS = {
+    register: () => 0,
+    brand: (a, b) => byText('brand')(a, b) || byText('size')(a, b) || n(a.gsm) - n(b.gsm),
+    size: (a, b) => byText('size')(a, b) || byText('brand')(a, b) || n(a.gsm) - n(b.gsm),
+    gsm: (a, b) => n(a.gsm) - n(b.gsm) || byText('brand')(a, b) || byText('size')(a, b),
+    cartons: (a, b) => n(b.cartons) - n(a.cartons) || n(b.reams) - n(a.reams),
+  };
+  const rows = pool
+    .filter(i => (!q || i.label.toLowerCase().includes(q))
+      && (!fBrand || i.brand === fBrand) && (!fSize || i.size === fSize) && (fGsm === '' || String(n(i.gsm)) === fGsm))
+    .sort(SORTS[sortBy]);
+  const filtering = !!(q || fBrand || fSize || fGsm !== '');
+  const rowTotal = rows.reduce((s, i) => ({ c: s.c + n(i.cartons), r: s.r + n(i.reams) }), { c: 0, r: 0 });
 
   const addPaper = async (e) => {
     e.preventDefault();
@@ -188,6 +211,30 @@ const StockTab = ({ items, loaded, call, notify, isAdmin, reload, currentUser })
           value={search} onChange={e => setSearch(e.target.value)} />
         <button className="btn btn-blue" onClick={() => setShowAdd(!showAdd)}>{showAdd ? 'Close' : '➕ Add Paper'}</button>
         <button className="btn btn-light" onClick={printStock}>🖨 Print</button>
+        <div className="paper-filters">
+          <select className="input" value={fBrand} onChange={e => setFBrand(e.target.value)}>
+            <option value="">All brands</option>
+            {brands.map(b => <option key={b}>{b}</option>)}
+          </select>
+          <select className="input" value={fSize} onChange={e => setFSize(e.target.value)}>
+            <option value="">All sizes</option>
+            {sizes.map(sz => <option key={sz}>{sz}</option>)}
+          </select>
+          <select className="input" value={fGsm} onChange={e => setFGsm(e.target.value)}>
+            <option value="">All GSM</option>
+            {gsms.map(g => <option key={g} value={String(g)}>{g ? `${g} GSM` : 'No GSM'}</option>)}
+          </select>
+          <select className="input" value={sortBy} onChange={e => setSortBy(e.target.value)}>
+            <option value="register">Sort: register order</option>
+            <option value="brand">Sort: brand</option>
+            <option value="size">Sort: size</option>
+            <option value="gsm">Sort: GSM</option>
+            <option value="cartons">Sort: most cartons</option>
+          </select>
+          {filtering && (
+            <button className="btn btn-light btn-sm" onClick={() => { setSearch(''); setFBrand(''); setFSize(''); setFGsm(''); }}>Clear filters</button>
+          )}
+        </div>
       </div>
 
       {showAdd && (
@@ -301,9 +348,14 @@ const StockTab = ({ items, loaded, call, notify, isAdmin, reload, currentUser })
                 </tr>
               ))}
             </tbody>
+            <tfoot><tr>
+              <td colSpan={3}>{filtering ? `${rows.length} of ${pool.length} papers` : `${rows.length} papers`}</td>
+              <td className="num">{n(rowTotal.c)}</td><td className="num">{n(rowTotal.r)}</td>
+            </tr></tfoot>
           </table>
         </div>
       )}
+      {filtering && rows.length === 0 && <div className="paper-empty" style={{ margin: 20 }}>No paper matches these filters.</div>}
       {isAdmin && items.some(i => !i.active) && (
         <label style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, color: 'var(--text-3)', padding: '10px 20px' }}>
           <input type="checkbox" checked={showInactive} onChange={e => setShowInactive(e.target.checked)} /> Show papers no longer in use
@@ -328,6 +380,7 @@ const EntryTab = ({ kind, items, call, notify, isAdmin, currentUser, reload }) =
   const [busy, setBusy] = useState(false);
   const [entries, setEntries] = useState([]);
   const [voiding, setVoiding] = useState(null); // {id, reason}
+  const [recounting, setRecounting] = useState(null); // opened-carton entry being recounted
   // Sales happen one at a time through the day, so issues default to a
   // one-paper form; a delivery challan is easier on the full grid.
   const [mode, setMode] = useState(isOut ? 'quick' : 'grid');
@@ -382,6 +435,16 @@ const EntryTab = ({ kind, items, call, notify, isAdmin, currentUser, reload }) =
     if (quick) paperSelect.current?.focus();
     notify(`${soldLabel || `${data.saved} paper(s)`} saved${date !== istToday() ? ` on ${prettyDay(date)}` : ''}.`
       + (data.opened?.length ? `\nOpened ${data.opened.join(', ')}.` : ''), 'success');
+  };
+
+  const confirmRecount = async () => {
+    setBusy(true);
+    const { ok, data } = await call(`/movements/${recounting.id}/recount`, { method: 'POST', body: '{}' });
+    setBusy(false);
+    if (!ok) { notify(data.error || 'Could not recount', 'error'); return; }
+    setRecounting(null);
+    await reload(); await loadEntries();
+    notify(`Carton recounted: ${data.from} → ${data.to} reams. Loose reams now ${data.stock.reams}.`, 'success');
   };
 
   const confirmVoid = async () => {
@@ -543,24 +606,45 @@ const EntryTab = ({ kind, items, call, notify, isAdmin, currentUser, reload }) =
       </div>
 
       <div className="card">
-        <div className="card-title">
-          {isOut ? 'Issued' : 'Received'} on {prettyDay(date)}
-          <span style={{ fontSize: 12, color: 'var(--text-3)', fontWeight: 600 }}>({dayEntries.filter(e => !e.voided && !e.parent_id).length})</span>
+        <div className="card-title" style={{ justifyContent: 'space-between', flexWrap: 'wrap' }}>
+          <span>
+            {isOut ? 'Issued' : 'Received'} on {prettyDay(date)}{' '}
+            <span style={{ fontSize: 12, color: 'var(--text-3)', fontWeight: 600 }}>({dayEntries.filter(e => !e.voided && !e.parent_id).length})</span>
+          </span>
+          <span style={{ display: 'flex', gap: 6 }}>
+            <button className="btn btn-light btn-sm" onClick={() => setDate(shiftYmd(date, -1))}>◀ Prev day</button>
+            <button className="btn btn-light btn-sm" disabled={today} onClick={() => setDate(shiftYmd(date, 1))}>▶</button>
+            <button className="btn btn-light btn-sm" disabled={today} onClick={() => setDate(istToday())}>Today</button>
+          </span>
         </div>
         {dayEntries.length === 0 ? (
           <div className="paper-empty">Nothing recorded yet.</div>
         ) : (
           <div className="table-wrap">
             <table className="paper-table">
-              <thead><tr><th>Paper</th><th>Type</th><th className="num">Qty</th><th>{isOut ? 'Issued to' : 'Supplier'}</th><th>Ref / Remarks</th><th>By</th><th></th></tr></thead>
+              <thead><tr><th>Paper</th><th>Type</th><th className="num">Qty</th><th>{isOut ? 'Issued to' : 'Supplier'}</th><th>Ref / Remarks</th><th>By</th></tr></thead>
               <tbody>
                 {dayEntries.map(e => {
-                  const canVoid = !e.voided && !e.parent_id && (isAdmin || (e.action_by === currentUser && today));
+                  const mine = isAdmin || (e.action_by === currentUser && e.entry_date === istToday());
+                  const canVoid = !e.voided && !e.parent_id && mine;
+                  const paper = items.find(i => i.id === e.item_id);
+                  const recountTo = e.movement_type === 'OPEN_CARTON' && !e.voided && mine && paper?.reams_per_carton
+                    && -e.cartons * paper.reams_per_carton !== n(e.reams) ? -e.cartons * paper.reams_per_carton : null;
                   const skin = TYPE_SKIN[e.movement_type] || TYPE_SKIN.OPEN_CARTON;
                   return (
                     <React.Fragment key={e.id}>
                       <tr style={e.voided ? { opacity: .45, textDecoration: 'line-through' } : undefined}>
-                        <td style={{ fontWeight: 600, color: 'var(--text)' }}>{e.label}</td>
+                        <td style={{ fontWeight: 600, color: 'var(--text)' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'space-between' }}>
+                            <span>{e.label}</span>
+                            {canVoid && <button className="btn btn-red btn-sm" style={{ flexShrink: 0 }} title="Void this entry"
+                              onClick={() => { setRecounting(null); setVoiding({ id: e.id, reason: '' }); }}>&#128465; Void</button>}
+                            {recountTo !== null && <button className="btn btn-orange btn-sm" style={{ flexShrink: 0 }}
+                              onClick={() => { setVoiding(null); setRecounting({ id: e.id, from: n(e.reams), to: recountTo, rpc: paper.reams_per_carton }); }}>
+                              Recount</button>}
+                            {e.voided && <span style={{ fontSize: 11, color: 'var(--red)', fontWeight: 700, flexShrink: 0 }}>voided</span>}
+                          </div>
+                        </td>
                         <td><span className="pill" style={{ background: skin.bg, color: skin.fg }}>{TYPE_LABEL[e.movement_type]}</span></td>
                         <td className="num" style={{ fontWeight: 700, whiteSpace: 'nowrap' }}>
                           {e.movement_type === 'OPEN_CARTON' ? `${-e.cartons} C → ${e.reams} R` : cr(Math.abs(e.cartons), Math.abs(e.reams))}
@@ -568,13 +652,21 @@ const EntryTab = ({ kind, items, call, notify, isAdmin, currentUser, reload }) =
                         <td>{e.party || '-'}</td>
                         <td style={{ fontSize: 12 }}>{[e.reference, e.remarks].filter(Boolean).join(' · ') || '-'}</td>
                         <td style={{ fontSize: 12, color: 'var(--text-3)' }}>{String(e.action_by).split('@')[0]}</td>
-                        <td style={{ textAlign: 'right' }}>
-                          {canVoid && <button className="btn btn-red btn-sm" title="Void this entry" onClick={() => setVoiding({ id: e.id, reason: '' })}>&#128465;</button>}
-                          {e.voided && <span style={{ fontSize: 11, color: 'var(--red)', fontWeight: 700 }}>voided</span>}
-                        </td>
                       </tr>
+                      {recounting && recounting.id === e.id && (
+                        <tr><td colSpan={6} style={{ background: '#fff7ed' }}>
+                          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                            <span style={{ color: '#9a3412', fontWeight: 700, fontSize: 13 }}>
+                              This carton was counted as {recounting.from} reams. Recount at {recounting.rpc} per carton = {recounting.to} reams?
+                              Loose reams change by {recounting.to - recounting.from > 0 ? '+' : ''}{recounting.to - recounting.from}. The sale itself stays as entered.
+                            </span>
+                            <button className="btn btn-orange btn-sm" disabled={busy} onClick={confirmRecount}>{busy ? 'Saving…' : `Recount to ${recounting.to} reams`}</button>
+                            <button className="btn btn-light btn-sm" onClick={() => setRecounting(null)}>Cancel</button>
+                          </div>
+                        </td></tr>
+                      )}
                       {voiding && voiding.id === e.id && (
-                        <tr><td colSpan={7} style={{ background: '#fef2f2' }}>
+                        <tr><td colSpan={6} style={{ background: '#fef2f2' }}>
                           <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                             <span style={{ color: '#991b1b', fontWeight: 700, fontSize: 13 }}>
                               Void {cr(Math.abs(e.cartons), Math.abs(e.reams))} of {e.label}?

@@ -1665,6 +1665,41 @@ app.get('/api/paper/report', auth, async (req, res) => {
   });
 });
 
+// A carton opened by an issue adds reams_per_carton loose reams. When that
+// figure was wrong at the time (e.g. 5 set for a 10-ream carton), the opening
+// is recounted at the paper's current figure instead of voiding the sale,
+// which later sales from those reams would block.
+app.post('/api/paper/movements/:id/recount', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: [row] } = await client.query(
+      `SELECT m.*, (m.created_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date AS today
+       FROM paper_movements m WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (!row || row.movement_type !== 'OPEN_CARTON') throw Object.assign(new Error('Only an opened-carton entry can be recounted'), { status: 400 });
+    if (row.voided) throw Object.assign(new Error('That entry is voided'), { status: 400 });
+    if (req.user.role !== 'admin' && (row.action_by !== req.user.email || !row.today)) {
+      throw Object.assign(new Error('Only the person who entered this, on the same day, or an owner can change it'), { status: 403 });
+    }
+    const { rows: [item] } = await client.query('SELECT * FROM paper_items WHERE id = $1 FOR UPDATE', [row.item_id]);
+    if (!item.reams_per_carton) throw Object.assign(new Error('Set reams per carton for this paper first'), { status: 400 });
+    const reams = +(-row.cartons * item.reams_per_carton).toFixed(3);
+    if (reams === row.reams) throw Object.assign(new Error(`Already counted at ${item.reams_per_carton} reams per carton`), { status: 400 });
+    await client.query(
+      `UPDATE paper_movements SET reams = $1, remarks = TRIM(COALESCE(remarks, '') || $2) WHERE id = $3`,
+      [reams, ` [recounted ${row.reams} -> ${reams} reams by ${req.user.email}]`, row.id]);
+    const stock = await paperStock(client, row.item_id);
+    if (stock.reams < 0) throw Object.assign(new Error('That would leave negative loose reams'), { status: 409 });
+    await client.query('COMMIT');
+    res.json({ from: row.reams, to: reams, stock });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(err.status || 500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // Whoever entered it can void it the same day; an owner can void any entry.
 // Voiding an issue also voids the carton it opened. Stock may never end up
 // negative, which catches voiding a receipt whose paper has already gone out.

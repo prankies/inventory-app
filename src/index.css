@@ -303,3 +303,7 @@ tbody tr:hover td { background: var(--primary-50); }
   .paper-quick .pq-paper, .paper-quick .pq-save { grid-column: 1 / -1; }
   .paper-quick .pq-save { justify-content: center; padding: 12px; font-size: 15px; }
 }
+
+.paper-filters { display: flex; gap: 8px; flex-wrap: wrap; width: 100%; align-items: center; }
+.paper-filters .input { margin-bottom: 0; width: auto; flex: 1 1 130px; padding: 8px 10px; font-size: 13px; }
+@media (max-width: 640px) { .paper-filters .input { flex: 1 1 45%; } }
