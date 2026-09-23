@@ -408,6 +408,27 @@ const initPaperDB = async () => {
     CREATE INDEX IF NOT EXISTS idx_paper_mv_item ON paper_movements (item_id, entry_date);
     CREATE INDEX IF NOT EXISTS idx_paper_mv_date ON paper_movements (entry_date);
     CREATE INDEX IF NOT EXISTS idx_paper_mv_parent ON paper_movements (parent_id);
+    CREATE TABLE IF NOT EXISTS paper_verifications (
+      id SERIAL PRIMARY KEY,
+      verify_date TEXT NOT NULL,
+      note TEXT DEFAULT '',
+      full_count BOOLEAN DEFAULT FALSE,
+      items_counted INTEGER DEFAULT 0,
+      items_adjusted INTEGER DEFAULT 0,
+      net_cartons REAL DEFAULT 0,
+      net_reams REAL DEFAULT 0,
+      verified_by TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS paper_verification_lines (
+      id SERIAL PRIMARY KEY,
+      verification_id INTEGER NOT NULL REFERENCES paper_verifications(id) ON DELETE CASCADE,
+      item_id INTEGER NOT NULL,
+      system_c REAL NOT NULL, system_r REAL NOT NULL,
+      counted_c REAL NOT NULL, counted_r REAL NOT NULL,
+      diff_c REAL NOT NULL, diff_r REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_paper_vlines ON paper_verification_lines (verification_id);
   `);
 };
 
@@ -1696,6 +1717,8 @@ app.get('/api/paper/report', auth, async (req, res) => {
        COALESCE(-SUM(m.cartons) FILTER (WHERE m.entry_date = $1 AND m.movement_type = 'OUT'), 0)::float AS out_c,
        COALESCE(-SUM(m.reams)   FILTER (WHERE m.entry_date = $1 AND m.movement_type = 'OUT'), 0)::float AS out_r,
        COALESCE(-SUM(m.cartons) FILTER (WHERE m.entry_date = $1 AND m.movement_type = 'OPEN_CARTON'), 0)::float AS opened_c,
+       COALESCE(SUM(m.cartons) FILTER (WHERE m.entry_date = $1 AND m.movement_type = 'ADJUST'), 0)::float AS adj_c,
+       COALESCE(SUM(m.reams)   FILTER (WHERE m.entry_date = $1 AND m.movement_type = 'ADJUST'), 0)::float AS adj_r,
        COALESCE(SUM(m.cartons), 0)::float AS close_c,
        COALESCE(SUM(m.reams), 0)::float   AS close_r,
        COUNT(m.id) FILTER (WHERE m.entry_date = $1) AS moves_today
@@ -1709,6 +1732,97 @@ app.get('/api/paper/report', auth, async (req, res) => {
       .filter(r => r.active || +r.moves_today > 0 || r.close_c || r.close_r)
       .map(r => ({ ...r, label: paperLabel(r) })),
   });
+});
+
+// ---- Physical count ---------------------------------------------------------
+// The floor figures for cartons and loose reams, typed against what the system
+// says. A blank box means that quantity was NOT counted and is left alone, so a
+// part count is safe -- unless full_count says every paper was walked. Each
+// difference is posted as its own ADJUST movement, so the ledger says plainly
+// that a count corrected the stock rather than dressing it up as a sale.
+app.post('/api/paper/verification', auth, async (req, res) => {
+  const { verify_date, note, full_count, lines } = req.body || {};
+  if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: 'Nothing counted' });
+  const today = istDate();
+  const date = IST_DATE_RE.test(verify_date || '') ? verify_date : today;
+  if (date > today) return res.status(400).json({ error: 'The date cannot be in the future' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const ids = [...new Set(lines.map(l => parseInt(l.item_id)).filter(Boolean))];
+    const { rows: items } = await client.query(
+      'SELECT * FROM paper_items WHERE id = ANY($1) ORDER BY id FOR UPDATE', [ids]);
+    const byId = new Map(items.map(i => [i.id, i]));
+
+    let counted = 0, adjusted = 0, netC = 0, netR = 0;
+    const applied = [];
+    const blank = (v) => v === '' || v === null || v === undefined;
+
+    for (const l of lines) {
+      const item = byId.get(parseInt(l.item_id));
+      if (!item) continue;
+      const cBlank = blank(l.cartons), rBlank = blank(l.reams);
+      if (cBlank && rBlank && !full_count) continue;           // not counted at all
+
+      const stock = await paperStock(client, item.id);
+      // A blank box is only treated as zero when the whole shelf was walked.
+      const countedC = cBlank ? (full_count ? 0 : stock.cartons) : num(l.cartons);
+      const countedR = rBlank ? (full_count ? 0 : stock.reams) : num(l.reams);
+      if (countedC < 0 || countedR < 0) {
+        throw Object.assign(new Error(`${paperLabel(item)}: a counted figure cannot be negative`), { status: 400 });
+      }
+      counted++;
+      const diffC = +(countedC - stock.cartons).toFixed(3);
+      const diffR = +(countedR - stock.reams).toFixed(3);
+      if (!diffC && !diffR) continue;
+
+      adjusted++; netC += diffC; netR += diffR;
+      await client.query(
+        `INSERT INTO paper_movements (item_id, movement_type, cartons, reams, party, reference, remarks, entry_date, action_by)
+         VALUES ($1,'ADJUST',$2,$3,'',$4,$5,$6,$7)`,
+        [item.id, diffC, diffR, `COUNT-${date}`,
+         `Physical count ${countedC} ctn + ${countedR} ream vs system ${stock.cartons} ctn + ${stock.reams} ream${note ? ' -- ' + String(note).trim() : ''}`,
+         date, req.user.email]);
+      applied.push({ item_id: item.id, label: paperLabel(item), system_c: stock.cartons, system_r: stock.reams,
+                     counted_c: countedC, counted_r: countedR, diff_c: diffC, diff_r: diffR });
+    }
+
+    if (!counted) throw Object.assign(new Error('Nothing counted -- type at least one figure'), { status: 400 });
+
+    const { rows: [header] } = await client.query(
+      `INSERT INTO paper_verifications (verify_date, note, full_count, items_counted, items_adjusted, net_cartons, net_reams, verified_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [date, String(note || '').trim(), !!full_count, counted, adjusted, +netC.toFixed(3), +netR.toFixed(3), req.user.email]);
+    for (const a of applied) {
+      await client.query(
+        `INSERT INTO paper_verification_lines (verification_id, item_id, system_c, system_r, counted_c, counted_r, diff_c, diff_r)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [header.id, a.item_id, a.system_c, a.system_r, a.counted_c, a.counted_r, a.diff_c, a.diff_r]);
+    }
+    await client.query('COMMIT');
+    res.json({ ...header, lines: applied });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(err.status || 500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/paper/verifications', auth, async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM paper_verifications ORDER BY id DESC LIMIT 50');
+  res.json(rows);
+});
+
+app.get('/api/paper/verifications/:id', auth, async (req, res) => {
+  const { rows: [header] } = await pool.query('SELECT * FROM paper_verifications WHERE id = $1', [req.params.id]);
+  if (!header) return res.status(404).json({ error: 'Count not found' });
+  const { rows: lines } = await pool.query(
+    `SELECT l.*, p.brand, p.size, p.gsm FROM paper_verification_lines l
+     JOIN paper_items p ON p.id = l.item_id WHERE l.verification_id = $1 ORDER BY p.sort_order, p.id`,
+    [req.params.id]);
+  res.json({ ...header, lines: lines.map(l => ({ ...l, label: paperLabel(l) })) });
 });
 
 // A carton opened by an issue adds reams_per_carton loose reams. When that

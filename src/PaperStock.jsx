@@ -46,13 +46,18 @@ const UNITS_ = [{ suffix: '_c', label: 'Cartons', grp: 'g-ctn' }, { suffix: '_r'
 const REG_COLS = UNITS_.flatMap(u => STAGES.map(st => ({ ...st, field: st.key + u.suffix, unit: u })));
 const regVal = (r, col) => (col.blank ? blankZero(r[col.field]) : n(r[col.field]));
 
-const TYPE_LABEL = { OPENING: 'Opening', IN: 'In', OUT: 'Issue', OPEN_CARTON: 'Carton opened' };
+const TYPE_LABEL = { OPENING: 'Opening', IN: 'In', OUT: 'Issue', OPEN_CARTON: 'Carton opened', ADJUST: 'Count correction' };
 const TYPE_SKIN = {
   OPENING: { bg: '#fef3c7', fg: '#92400e' },
   IN: { bg: '#dcfce7', fg: '#166534' },
   OUT: { bg: '#ffedd5', fg: '#c2410c' },
   OPEN_CARTON: { bg: '#f1f5f9', fg: '#475569' },
+  ADJUST: { bg: '#ede9fe', fg: '#5b21b6' },
 };
+
+// "+2 C / -1 R", blanks dropped -- used for count differences.
+const diffText = (c, r) => [n(c) ? `${n(c) > 0 ? '+' : ''}${n(c)} C` : '', n(r) ? `${n(r) > 0 ? '+' : ''}${n(r)} R` : '']
+  .filter(Boolean).join(' / ');
 
 const PaperStock = ({ token, notify, currentUser, isAdmin, onUnauthorized }) => {
   const [tab, setTab] = useState(() => {
@@ -106,7 +111,7 @@ const PaperStock = ({ token, notify, currentUser, isAdmin, onUnauthorized }) => 
       </div>
 
       <div className="mode-tabs paper-tabs">
-        {[['stock', '📋 Stock'], ['in', '📥 Inward'], ['out', '📤 Sale / Issue'], ['report', '📅 Daily Report'], ['ledger', '📒 Ledger']].map(([k, label]) => (
+        {[['stock', '📋 Stock'], ['in', '📥 Inward'], ['out', '📤 Sale / Issue'], ['report', '📅 Daily Report'], ['ledger', '📒 Ledger'], ['count', '✅ Count']].map(([k, label]) => (
           <button key={k} className={`mode-tab ${tab === k ? 'active' : ''}`} onClick={() => setTab(k)}>{label}</button>
         ))}
       </div>
@@ -115,6 +120,9 @@ const PaperStock = ({ token, notify, currentUser, isAdmin, onUnauthorized }) => 
         <StockTab items={items} loaded={loaded} call={call} notify={notify} isAdmin={isAdmin}
           reload={loadItems} currentUser={currentUser}
           openLedger={(id) => { setLedgerItem(String(id)); setTab('ledger'); }} />
+      )}
+      {tab === 'count' && (
+        <CountTab items={active} call={call} notify={notify} currentUser={currentUser} reload={loadItems} />
       )}
       {tab === 'ledger' && (
         <LedgerTab items={items} call={call} notify={notify} currentUser={currentUser}
@@ -737,7 +745,7 @@ const ReportTab = ({ call, notify, currentUser }) => {
           <tr>${REG_COLS.map((c, i) => `<th class="${i === 4 ? 'split' : ''}">${c.label}</th>`).join('')}</tr>
         </thead>
         <tbody>${shown.map((r, k) => `<tr>
-          <td>${k + 1}</td><td class="name">${esc(r.label)}${n(r.opened_c) ? `<small> (${n(r.opened_c)} ctn opened)</small>` : ''}</td>
+          <td>${k + 1}</td><td class="name">${esc(r.label)}${n(r.opened_c) ? `<small> (${n(r.opened_c)} ctn opened)</small>` : ''}${(n(r.adj_c) || n(r.adj_r)) ? `<small> (count correction ${diffText(r.adj_c, r.adj_r)})</small>` : ''}</td>
           ${REG_COLS.map((c, i) => `<td class="${c.key === 'close' ? 'b' : ''} ${i === 4 ? 'split' : ''}">${regVal(r, c)}</td>`).join('')}</tr>`).join('')}</tbody>
         <tfoot><tr><td colspan="2">Total</td>${REG_COLS.map((c, i) => `<td class="${i === 4 ? 'split' : ''}">${T(c.field)}</td>`).join('')}</tr></tfoot>
       </table>
@@ -806,6 +814,9 @@ const ReportTab = ({ call, notify, currentUser }) => {
                   <td style={{ fontWeight: 600, color: 'var(--text)', whiteSpace: 'nowrap' }}>
                     {r.label}
                     {n(r.opened_c) > 0 && <div style={{ fontSize: 11, color: '#b45309' }}>{n(r.opened_c)} carton opened</div>}
+                    {(n(r.adj_c) !== 0 || n(r.adj_r) !== 0) && (
+                      <div style={{ fontSize: 11, color: '#6d28d9', fontWeight: 700 }}>count correction {diffText(r.adj_c, r.adj_r)}</div>
+                    )}
                   </td>
                   {REG_COLS.map((c, i) => <td key={c.field} className={`num ${c.cls} ${i === 4 ? 'split' : ''}`}>{regVal(r, c)}</td>)}
                 </tr>
@@ -821,6 +832,210 @@ const ReportTab = ({ call, notify, currentUser }) => {
         </div>
       )}
     </div>
+  );
+};
+
+// ---- Physical count ---------------------------------------------------------
+const CountTab = ({ items, call, notify, currentUser, reload }) => {
+  const [date, setDate] = useState(istToday());
+  const [note, setNote] = useState('');
+  const [fullCount, setFullCount] = useState(false);
+  const [counts, setCounts] = useState({});      // item_id -> {c, r} as typed
+  const [search, setSearch] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [history, setHistory] = useState([]);
+  const [openId, setOpenId] = useState(null);
+  const [detail, setDetail] = useState(null);
+
+  const loadHistory = useCallback(async () => {
+    const { ok, data } = await call('/verifications');
+    if (ok) setHistory(Array.isArray(data) ? data : []);
+  }, [call]);
+  useEffect(() => { loadHistory(); }, [loadHistory]);
+
+  useEffect(() => {
+    if (!openId) { setDetail(null); return; }
+    let live = true;
+    call(`/verifications/${openId}`).then(({ ok, data }) => { if (live) setDetail(ok ? data : null); });
+    return () => { live = false; };
+  }, [call, openId]);
+
+  const typed = (i) => counts[i.id] || {};
+  const blank = (v) => v === undefined || v === '';
+  const lineOf = (i) => {
+    const v = typed(i);
+    const cBlank = blank(v.c), rBlank = blank(v.r);
+    if (cBlank && rBlank && !fullCount) return null;
+    const c = cBlank ? (fullCount ? 0 : n(i.cartons)) : n(v.c);
+    const r = rBlank ? (fullCount ? 0 : n(i.reams)) : n(v.r);
+    return { item_id: i.id, counted_c: c, counted_r: r, diff_c: +(c - n(i.cartons)).toFixed(3), diff_r: +(r - n(i.reams)).toFixed(3) };
+  };
+  const lines = items.map(lineOf).filter(Boolean);
+  const changing = lines.filter(l => l.diff_c || l.diff_r);
+  const net = changing.reduce((s, l) => ({ c: s.c + l.diff_c, r: s.r + l.diff_r }), { c: 0, r: 0 });
+
+  const save = async () => {
+    if (!lines.length) { notify('Type at least one counted figure.', 'error'); return; }
+    setBusy(true);
+    const { ok, data } = await call('/verification', {
+      method: 'POST',
+      body: JSON.stringify({
+        verify_date: date, note, full_count: fullCount,
+        lines: items.map(i => ({ item_id: i.id, cartons: typed(i).c ?? '', reams: typed(i).r ?? '' })),
+      }),
+    });
+    setBusy(false);
+    if (!ok) { notify(data.error || 'Could not save the count', 'error'); return; }
+    setCounts({}); setNote(''); setFullCount(false);
+    await reload(); await loadHistory();
+    notify(`Count saved — ${data.items_counted} counted, ${data.items_adjusted} corrected` +
+      (data.items_adjusted ? `, net ${diffText(data.net_cartons, data.net_reams) || 'nil'}.` : '.'), 'success');
+  };
+
+  const printSheet = () => {
+    openPrint(`Paper Count Sheet — ${prettyDay(date)}`, `
+      <div class="meta"><span>Counted by: ______________________</span><span>Date: ${prettyDay(date)}</span></div>
+      <table>
+        <thead><tr><th>Sl.</th><th>Brand / Paper</th><th class="num">System Ctn</th><th class="num">System Ream</th><th class="num">Counted Ctn</th><th class="num">Counted Ream</th></tr></thead>
+        <tbody>${items.map((i, k) => `<tr><td>${k + 1}</td><td>${esc(i.label)}</td>
+          <td class="num">${n(i.cartons)}</td><td class="num">${n(i.reams)}</td><td></td><td></td></tr>`).join('')}</tbody>
+      </table>`);
+  };
+
+  const q = search.trim().toLowerCase();
+  const shown = items.filter(i => !q || i.label.toLowerCase().includes(q));
+
+  return (
+    <>
+      <div className="card" style={{ border: '2px solid #16a34a' }}>
+        <div className="card-title" style={{ justifyContent: 'space-between', flexWrap: 'wrap' }}>
+          <span>✅ Physical Count</span>
+          <button className="btn btn-light btn-sm" onClick={printSheet}>🖨 Blank count sheet</button>
+        </div>
+        <p style={{ fontSize: 13, color: 'var(--text-2)', marginBottom: 12 }}>
+          Count the shelf and type the real figures. A box left <strong>blank is not counted</strong> and is left exactly
+          as it is, so counting only a few papers — or only the cartons — is safe. Every difference is posted to that
+          paper's ledger as a <strong>count correction</strong>, never as a sale or a receipt.
+        </p>
+
+        <div className="paper-head-row">
+          <div>
+            <label className="field-label">Date counted</label>
+            <input className="input" style={{ marginBottom: 0 }} type="date" value={date} max={istToday()}
+              onChange={e => setDate(e.target.value || istToday())} />
+          </div>
+          <div style={{ gridColumn: 'span 2' }}>
+            <label className="field-label">Note (why this count was done)</label>
+            <input className="input" style={{ marginBottom: 0 }} placeholder="Optional" value={note} onChange={e => setNote(e.target.value)} />
+          </div>
+          <div>
+            <label className="field-label">Search</label>
+            <input className="input" style={{ marginBottom: 0 }} placeholder="Filter papers" value={search} onChange={e => setSearch(e.target.value)} />
+          </div>
+        </div>
+
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, fontSize: 13, fontWeight: 600, color: '#b45309' }}>
+          <input type="checkbox" checked={fullCount} onChange={e => setFullCount(e.target.checked)} />
+          I counted every paper — treat blank boxes as ZERO
+        </label>
+
+        {items.length === 0 ? (
+          <div className="paper-empty" style={{ marginTop: 14 }}>Add your papers in the Stock tab first.</div>
+        ) : (
+          <>
+            <div className="table-wrap" style={{ marginTop: 14 }}>
+              <table className="paper-table">
+                <thead><tr>
+                  <th>Brand / Paper</th><th className="num">System</th>
+                  <th className="num">Counted Ctn</th><th className="num">Counted Ream</th><th className="num">Difference</th>
+                </tr></thead>
+                <tbody>
+                  {shown.map(i => {
+                    const l = lineOf(i);
+                    const v = typed(i);
+                    const diff = l && (l.diff_c || l.diff_r) ? diffText(l.diff_c, l.diff_r) : null;
+                    return (
+                      <tr key={i.id} className={l ? (diff ? 'row-short' : 'row-filled') : ''}>
+                        <td style={{ fontWeight: 600, color: 'var(--text)' }}>{i.label}</td>
+                        <td className="num" style={{ color: 'var(--text-3)', whiteSpace: 'nowrap', fontSize: 13 }}>{cr(i.cartons, i.reams)}</td>
+                        <td className="num">
+                          <input className="input qty-in" type="number" inputMode="numeric" min="0" step="any" placeholder="—"
+                            value={v.c ?? ''} onChange={e => setCounts({ ...counts, [i.id]: { ...v, c: e.target.value } })} />
+                        </td>
+                        <td className="num">
+                          <input className="input qty-in" type="number" inputMode="numeric" min="0" step="any" placeholder="—"
+                            value={v.r ?? ''} onChange={e => setCounts({ ...counts, [i.id]: { ...v, r: e.target.value } })} />
+                        </td>
+                        <td className="num" style={{ fontWeight: 700, whiteSpace: 'nowrap', color: diff ? '#dc2626' : 'var(--text-3)' }}>
+                          {l ? (diff || 'matches') : '—'}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ display: 'flex', gap: 10, marginTop: 14, alignItems: 'center', flexWrap: 'wrap' }}>
+              <button className="btn btn-green" disabled={busy || !lines.length} onClick={save}>
+                {busy ? 'Saving…' : '✅ Post count'}
+              </button>
+              <span style={{ fontSize: 13, color: 'var(--text-2)', fontWeight: 600 }}>
+                {lines.length} counted · {changing.length} to correct{changing.length ? ` · net ${diffText(net.c, net.r)}` : ''}
+              </span>
+              {lines.length > 0 && <button className="btn btn-light btn-sm" onClick={() => setCounts({})}>Clear</button>}
+            </div>
+          </>
+        )}
+      </div>
+
+      <div className="card">
+        <div className="card-title">Past counts</div>
+        {history.length === 0 ? (
+          <div className="paper-empty">No count posted yet.</div>
+        ) : (
+          <div className="table-wrap">
+            <table className="paper-table">
+              <thead><tr><th>Date</th><th className="num">Counted</th><th className="num">Corrected</th><th className="num">Net change</th><th>By</th></tr></thead>
+              <tbody>
+                {history.map(h => (
+                  <React.Fragment key={h.id}>
+                    <tr onClick={() => setOpenId(openId === h.id ? null : h.id)} style={{ cursor: 'pointer' }}>
+                      <td style={{ fontWeight: 600, color: 'var(--text)' }}>
+                        {prettyDay(h.verify_date)}{h.full_count && <span className="pill" style={{ marginLeft: 6, background: '#fff7ed', color: '#b45309' }}>full</span>}
+                        {h.note && <div style={{ fontSize: 11, color: 'var(--text-3)' }}>{h.note}</div>}
+                      </td>
+                      <td className="num">{h.items_counted}</td>
+                      <td className="num">{h.items_adjusted}</td>
+                      <td className="num" style={{ fontWeight: 700 }}>{diffText(h.net_cartons, h.net_reams) || 'nil'}</td>
+                      <td style={{ fontSize: 12, color: 'var(--text-3)' }}>{String(h.verified_by).split('@')[0]}</td>
+                    </tr>
+                    {openId === h.id && (
+                      <tr><td colSpan={5} style={{ background: 'var(--surface-2)' }}>
+                        {!detail ? 'Loading…' : detail.lines.length === 0 ? 'Everything matched — nothing was corrected.' : (
+                          <table className="paper-table">
+                            <thead><tr><th>Paper</th><th className="num">System</th><th className="num">Counted</th><th className="num">Difference</th></tr></thead>
+                            <tbody>
+                              {detail.lines.map(l => (
+                                <tr key={l.id}>
+                                  <td style={{ fontWeight: 600 }}>{l.label}</td>
+                                  <td className="num">{cr(l.system_c, l.system_r)}</td>
+                                  <td className="num">{cr(l.counted_c, l.counted_r)}</td>
+                                  <td className="num" style={{ fontWeight: 700, color: '#6d28d9' }}>{diffText(l.diff_c, l.diff_r)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
+                      </td></tr>
+                    )}
+                  </React.Fragment>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </>
   );
 };
 
