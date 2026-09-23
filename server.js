@@ -1637,6 +1637,52 @@ app.get('/api/paper/movements', auth, async (req, res) => {
   res.json(rows.map(r => ({ ...r, label: paperLabel(r) })));
 });
 
+// One paper's whole history with a running balance. Built from the movements
+// that were always recorded, so it covers everything entered since day one.
+// Voided rows are returned too, marked, but never counted in the balance.
+app.get('/api/paper/ledger', auth, async (req, res) => {
+  const itemId = parseInt(req.query.item_id);
+  if (!itemId) return res.status(400).json({ error: 'Choose a paper' });
+  const { rows: [item] } = await pool.query('SELECT * FROM paper_items WHERE id = $1', [itemId]);
+  if (!item) return res.status(404).json({ error: 'Paper not found' });
+
+  const params = [itemId];
+  const where = ['m.item_id = $1'];
+  if (IST_DATE_RE.test(req.query.from || '')) { params.push(req.query.from); where.push(`m.entry_date >= $${params.length}`); }
+  if (IST_DATE_RE.test(req.query.to || ''))   { params.push(req.query.to);   where.push(`m.entry_date <= $${params.length}`); }
+
+  // Anything before the range is folded into one opening line, so a filtered
+  // ledger still starts from the right balance instead of zero.
+  const { rows: [before] } = await pool.query(
+    `SELECT COALESCE(SUM(cartons), 0)::float AS cartons, COALESCE(SUM(reams), 0)::float AS reams, COUNT(*)::int AS entries
+     FROM paper_movements WHERE item_id = $1 AND NOT voided
+       AND entry_date < $2`,
+    [itemId, IST_DATE_RE.test(req.query.from || '') ? req.query.from : null]);
+
+  // A carton is opened so that an issue can be made, so it belongs immediately
+  // BEFORE the issue that caused it -- otherwise the running balance dips into
+  // negative reams for one line. Sorting by the parent's id puts the pair
+  // together, and the child first.
+  const ORDER = `m.entry_date, COALESCE(m.parent_id, m.id), (m.parent_id IS NULL)`;
+  const { rows } = await pool.query(
+    `SELECT m.*,
+       $${params.length + 1}::float + SUM(CASE WHEN m.voided THEN 0 ELSE m.cartons END)
+         OVER (ORDER BY ${ORDER} ROWS UNBOUNDED PRECEDING) AS bal_c,
+       $${params.length + 2}::float + SUM(CASE WHEN m.voided THEN 0 ELSE m.reams END)
+         OVER (ORDER BY ${ORDER} ROWS UNBOUNDED PRECEDING) AS bal_r
+     FROM paper_movements m
+     WHERE ${where.join(' AND ')}
+     ORDER BY ${ORDER}
+     LIMIT 1000`,
+    [...params, before.cartons, before.reams]);
+
+  res.json({
+    item: { ...item, label: paperLabel(item) },
+    brought_forward: before,
+    rows,
+  });
+});
+
 // The register for one day: every paper's opening, in, issue and closing. An
 // opening-stock entry made on the day itself counts as opening, not as a receipt.
 app.get('/api/paper/report', auth, async (req, res) => {

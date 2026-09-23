@@ -59,6 +59,7 @@ const PaperStock = ({ token, notify, currentUser, isAdmin, onUnauthorized }) => 
     try { return localStorage.getItem('paper_tab') || 'stock'; } catch { return 'stock'; }
   });
   const [items, setItems] = useState([]);
+  const [ledgerItem, setLedgerItem] = useState('');
   const [loaded, setLoaded] = useState(false);
   // Held in a ref so a new callback from the parent on every render does not
   // rebuild `call` and re-trigger every load effect below.
@@ -105,14 +106,19 @@ const PaperStock = ({ token, notify, currentUser, isAdmin, onUnauthorized }) => 
       </div>
 
       <div className="mode-tabs paper-tabs">
-        {[['stock', '📋 Stock'], ['in', '📥 Inward'], ['out', '📤 Sale / Issue'], ['report', '📅 Daily Report']].map(([k, label]) => (
+        {[['stock', '📋 Stock'], ['in', '📥 Inward'], ['out', '📤 Sale / Issue'], ['report', '📅 Daily Report'], ['ledger', '📒 Ledger']].map(([k, label]) => (
           <button key={k} className={`mode-tab ${tab === k ? 'active' : ''}`} onClick={() => setTab(k)}>{label}</button>
         ))}
       </div>
 
       {tab === 'stock' && (
         <StockTab items={items} loaded={loaded} call={call} notify={notify} isAdmin={isAdmin}
-          reload={loadItems} currentUser={currentUser} />
+          reload={loadItems} currentUser={currentUser}
+          openLedger={(id) => { setLedgerItem(String(id)); setTab('ledger'); }} />
+      )}
+      {tab === 'ledger' && (
+        <LedgerTab items={items} call={call} notify={notify} currentUser={currentUser}
+          itemId={ledgerItem} setItemId={setLedgerItem} />
       )}
       {(tab === 'in' || tab === 'out') && (
         <EntryTab key={tab} kind={tab} items={active} call={call} notify={notify} isAdmin={isAdmin}
@@ -124,7 +130,7 @@ const PaperStock = ({ token, notify, currentUser, isAdmin, onUnauthorized }) => 
 };
 
 // ---- Stock ------------------------------------------------------------------
-const StockTab = ({ items, loaded, call, notify, isAdmin, reload, currentUser }) => {
+const StockTab = ({ items, loaded, call, notify, isAdmin, reload, currentUser, openLedger }) => {
   const [search, setSearch] = useState('');
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({ brand: '', size: 'A4', gsm: '', reams_per_carton: '10' });
@@ -333,6 +339,8 @@ const StockTab = ({ items, loaded, call, notify, isAdmin, reload, currentUser })
                   <td style={{ fontWeight: 600, color: 'var(--text)' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'space-between' }}>
                       <span>{i.label}{!i.active && ' (not in use)'}</span>
+                      <button className="btn btn-light btn-sm" title="Movement history of this paper"
+                        style={{ flexShrink: 0 }} onClick={() => openLedger(i.id)}>📒</button>
                       {isAdmin && (
                         <button className="btn btn-light btn-sm" title="Edit this paper" style={{ flexShrink: 0 }}
                           onClick={() => setEditing({
@@ -811,6 +819,153 @@ const ReportTab = ({ call, notify, currentUser }) => {
             </tfoot>
           </table>
         </div>
+      )}
+    </div>
+  );
+};
+
+// ---- One paper's ledger -----------------------------------------------------
+const LedgerTab = ({ items, call, notify, currentUser, itemId, setItemId }) => {
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!itemId) { setData(null); return; }
+    let live = true;
+    setLoading(true);
+    const qs = new URLSearchParams({ item_id: itemId, ...(from ? { from } : {}), ...(to ? { to } : {}) });
+    call(`/ledger?${qs}`).then(({ ok, data: d }) => {
+      if (!live) return;
+      setData(ok ? d : null);
+      if (!ok) notify(d.error || 'Could not load the ledger', 'error');
+      setLoading(false);
+    });
+    return () => { live = false; };
+  }, [call, itemId, from, to, notify]);
+
+  const rows = data?.rows || [];
+  const bf = data?.brought_forward;
+  const sums = rows.filter(r => !r.voided).reduce((s, r) => {
+    if (r.movement_type === 'OUT') { s.out_c += -r.cartons; s.out_r += -r.reams; }
+    else if (r.movement_type !== 'OPEN_CARTON') { s.in_c += r.cartons; s.in_r += r.reams; }
+    return s;
+  }, { in_c: 0, in_r: 0, out_c: 0, out_r: 0 });
+  const last = rows.filter(r => !r.voided).slice(-1)[0];
+  const closing = last ? { c: n(last.bal_c), r: n(last.bal_r) } : { c: n(bf?.cartons), r: n(bf?.reams) };
+
+  const printLedger = () => {
+    if (!data) return;
+    openPrint(`Paper Ledger — ${data.item.label}`, `
+      <div class="meta"><span>${from || to ? `${from ? prettyDay(from) : 'start'} to ${to ? prettyDay(to) : 'today'}` : 'Full history'}</span><span>Printed by: ${esc(currentUser)}</span></div>
+      <table>
+        <thead><tr><th>Date</th><th>Entry</th><th class="num">Cartons</th><th class="num">Reams</th><th>Party / Reference</th><th class="num">Balance Ctn</th><th class="num">Balance Ream</th></tr></thead>
+        <tbody>
+          <tr><td>-</td><td>Brought forward</td><td class="num">-</td><td class="num">-</td><td>${bf?.entries || 0} earlier entr(y/ies)</td>
+            <td class="num b">${n(bf?.cartons)}</td><td class="num b">${n(bf?.reams)}</td></tr>
+          ${rows.map(r => `<tr>
+            <td>${prettyDay(r.entry_date)}</td>
+            <td>${TYPE_LABEL[r.movement_type] || r.movement_type}${r.voided ? ' (VOIDED)' : ''}</td>
+            <td class="num">${r.cartons ? n(r.cartons) : '-'}</td><td class="num">${r.reams ? n(r.reams) : '-'}</td>
+            <td>${esc([r.party, r.reference, r.remarks].filter(Boolean).join(' · ') || '-')}</td>
+            <td class="num b">${r.voided ? '-' : n(r.bal_c)}</td><td class="num b">${r.voided ? '-' : n(r.bal_r)}</td></tr>`).join('')}
+        </tbody>
+        <tfoot><tr><td colspan="2">Closing balance</td><td class="num">${n(sums.in_c)} in / ${n(sums.out_c)} out</td>
+          <td class="num">${n(sums.in_r)} in / ${n(sums.out_r)} out</td><td></td>
+          <td class="num">${closing.c}</td><td class="num">${closing.r}</td></tr></tfoot>
+      </table>`);
+  };
+
+  return (
+    <div className="card" style={{ border: '2px solid #b45309' }}>
+      <div className="card-title" style={{ justifyContent: 'space-between', flexWrap: 'wrap' }}>
+        <span>📒 Paper Ledger</span>
+        {data && <button className="btn btn-light btn-sm" onClick={printLedger}>🖨 Print</button>}
+      </div>
+
+      <div className="paper-head-row">
+        <div style={{ gridColumn: 'span 2' }}>
+          <label className="field-label">Paper *</label>
+          <select className="input" style={{ marginBottom: 0 }} value={itemId} onChange={e => setItemId(e.target.value)}>
+            <option value="">Choose paper…</option>
+            {items.map(i => <option key={i.id} value={i.id}>{i.label}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="field-label">From</label>
+          <input className="input" style={{ marginBottom: 0 }} type="date" value={from} max={to || istToday()}
+            onChange={e => setFrom(e.target.value)} />
+        </div>
+        <div>
+          <label className="field-label">To</label>
+          <input className="input" style={{ marginBottom: 0 }} type="date" value={to} max={istToday()}
+            onChange={e => setTo(e.target.value)} />
+        </div>
+      </div>
+      {(from || to) && (
+        <button className="btn btn-light btn-sm" style={{ marginTop: 10 }} onClick={() => { setFrom(''); setTo(''); }}>
+          Clear dates — show full history
+        </button>
+      )}
+
+      {!itemId ? (
+        <div className="paper-empty" style={{ marginTop: 14 }}>Choose a paper to see every entry made for it.</div>
+      ) : loading ? (
+        <div className="paper-empty" style={{ marginTop: 14 }}>Loading…</div>
+      ) : (
+        <>
+          <div className="ledger-summary">
+            <div><span>Balance now</span><strong>{cr(closing.c, closing.r)}</strong></div>
+            <div><span>Total in</span><strong>{cr(sums.in_c, sums.in_r)}</strong></div>
+            <div><span>Total issued</span><strong>{cr(sums.out_c, sums.out_r)}</strong></div>
+            <div><span>Entries</span><strong>{rows.filter(r => !r.voided).length}</strong></div>
+          </div>
+          <div className="table-wrap" style={{ marginTop: 14 }}>
+            <table className="paper-table">
+              <thead><tr>
+                <th>Date</th><th>Entry</th><th className="num">Ctn</th><th className="num">Ream</th>
+                <th>Party / Reference</th><th className="num">Balance</th><th>By</th>
+              </tr></thead>
+              <tbody>
+                <tr style={{ background: 'var(--surface-2)' }}>
+                  <td>—</td>
+                  <td style={{ fontWeight: 600 }}>Brought forward</td>
+                  <td className="num">—</td><td className="num">—</td>
+                  <td style={{ fontSize: 12, color: 'var(--text-3)' }}>{bf?.entries || 0} earlier entr{(bf?.entries === 1) ? 'y' : 'ies'}</td>
+                  <td className="num" style={{ fontWeight: 700 }}>{cr(bf?.cartons, bf?.reams)}</td>
+                  <td></td>
+                </tr>
+                {rows.map(r => {
+                  const skin = TYPE_SKIN[r.movement_type] || TYPE_SKIN.OPEN_CARTON;
+                  return (
+                    <tr key={r.id} style={r.voided ? { opacity: .45 } : undefined}>
+                      <td style={{ whiteSpace: 'nowrap' }}>{prettyDay(r.entry_date)}</td>
+                      <td>
+                        <span className="pill" style={{ background: skin.bg, color: skin.fg }}>{TYPE_LABEL[r.movement_type]}</span>
+                        {r.voided && <span style={{ marginLeft: 6, fontSize: 11, fontWeight: 700, color: 'var(--red)' }}>voided</span>}
+                      </td>
+                      <td className="num" style={{ fontWeight: 700, color: n(r.cartons) < 0 ? '#c2410c' : '#15803d' }}>
+                        {n(r.cartons) ? (n(r.cartons) > 0 ? `+${n(r.cartons)}` : n(r.cartons)) : '—'}
+                      </td>
+                      <td className="num" style={{ fontWeight: 700, color: n(r.reams) < 0 ? '#c2410c' : '#15803d' }}>
+                        {n(r.reams) ? (n(r.reams) > 0 ? `+${n(r.reams)}` : n(r.reams)) : '—'}
+                      </td>
+                      <td style={{ fontSize: 12 }}>{[r.party, r.reference, r.remarks].filter(Boolean).join(' · ') || '-'}</td>
+                      <td className="num" style={{ fontWeight: 700, whiteSpace: 'nowrap' }}>{r.voided ? '—' : cr(r.bal_c, r.bal_r)}</td>
+                      <td style={{ fontSize: 12, color: 'var(--text-3)' }}>{String(r.action_by).split('@')[0]}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          {rows.length === 0 && (
+            <div className="paper-empty" style={{ marginTop: 12 }}>
+              No entries{from || to ? ' in these dates' : ' yet'} for this paper.
+            </div>
+          )}
+        </>
       )}
     </div>
   );
